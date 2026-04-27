@@ -101,8 +101,11 @@ def density_map_gpu(matrix, out_size: int):
     col_gpu = cp.asarray(coo.col.astype(np.int64, copy=False))
     rb = cp.minimum((row_gpu * out_size) // rows, out_size - 1)
     cb = cp.minimum((col_gpu * out_size) // cols, out_size - 1)
-    linear = (rb * out_size + cb).astype(cp.int64, copy=False)
-    counts = cp.bincount(linear, minlength=out_size * out_size).reshape(out_size, out_size).astype(cp.float32)
+    linear = (rb * out_size + cb).astype(cp.int32, copy=False)
+    counts = cp.zeros(out_size * out_size, dtype=cp.float32)
+    import cupyx
+    cupyx.scatter_add(counts, linear, cp.float32(1.0))
+    counts = counts.reshape(out_size, out_size)
     row_edges = cp.floor(cp.arange(out_size + 1, dtype=cp.float64) * rows / out_size).astype(cp.int64)
     col_edges = cp.floor(cp.arange(out_size + 1, dtype=cp.float64) * cols / out_size).astype(cp.int64)
     row_sizes = cp.maximum(row_edges[1:] - row_edges[:-1], 1).astype(cp.float32)
