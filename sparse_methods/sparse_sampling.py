@@ -3,13 +3,18 @@ import os
 import time
 
 import cupy as cp
+import cupyx.scipy.sparse as cusp
 import numpy as np
+from scipy.sparse import csr_matrix, issparse
 
 import approx_fft_benchmark as sparse_bench
 
 
 SPARSE_DIRECT_MAX_OPS = int(float(os.environ.get("SPARSE_DIRECT_MAX_OPS", "5e10")))
 SPARSE_DIRECT_MAX_POINTS = int(float(os.environ.get("SPARSE_DIRECT_MAX_POINTS", "1000000")))
+SPARSE_SEP_G_BUDGET_BYTES = int(float(os.environ.get("SPARSE_SEP_G_BUDGET_BYTES", str(4 * (1 << 30)))))
+SPARSE_SEP_BATCH_V = int(os.environ.get("SPARSE_SEP_BATCH_V", "64"))
+SPARSE_SEP_BATCH_U = int(os.environ.get("SPARSE_SEP_BATCH_U", "64"))
 
 
 def sampled_features_from_coeffs(points, counts: dict, meta: dict, coeffs: np.ndarray, radial_bins: int, elapsed: float) -> dict:
@@ -103,22 +108,19 @@ def cartesian_grid_sample_points(rows: int, cols: int):
     return points, counts, meta
 
 
-def sampled_sparse_fft_features_from_points(matrix, points, counts: dict, meta: dict, radial_bins: int, batch_size: int):
-    matrix = matrix.tocoo(copy=False)
+def _coeffs_direct(matrix, points, batch_size: int) -> np.ndarray:
+    coo = matrix.tocoo(copy=False)
     rows, cols = matrix.shape
     if len(points) > SPARSE_DIRECT_MAX_POINTS:
         raise MemoryError(f"sample grid has {len(points)} points > limit {SPARSE_DIRECT_MAX_POINTS}")
     estimated_ops = int(len(points)) * int(matrix.nnz)
     if estimated_ops > SPARSE_DIRECT_MAX_OPS:
         raise MemoryError(f"sparse direct workload {estimated_ops} exceeds limit {SPARSE_DIRECT_MAX_OPS}")
-
-    r_idx = cp.asarray(matrix.row.astype(np.float32))
-    c_idx = cp.asarray(matrix.col.astype(np.float32))
+    r_idx = cp.asarray(coo.row.astype(np.float32))
+    c_idx = cp.asarray(coo.col.astype(np.float32))
     freq_u = cp.asarray(np.array([point.u_freq for point in points], dtype=np.float32))
     freq_v = cp.asarray(np.array([point.v_freq for point in points], dtype=np.float32))
-
     coeffs = np.empty(len(points), dtype=np.complex64)
-    started = time.perf_counter()
     for start in range(0, len(points), batch_size):
         stop = min(start + batch_size, len(points))
         u_batch = freq_u[start:stop]
@@ -129,9 +131,97 @@ def sampled_sparse_fft_features_from_points(matrix, points, counts: dict, meta: 
         )
         coeff_batch = cp.exp((-1j * sparse_bench.TWO_PI) * phase).astype(cp.complex64).sum(axis=1)
         coeffs[start:stop] = cp.asnumpy(coeff_batch)
-        del phase
-        del coeff_batch
+        del phase, coeff_batch
         sparse_bench.clear_gpu_memory()
+    return coeffs
+
+
+def _detect_cartesian(points):
+    u_set = sorted({p.u_freq for p in points})
+    v_set = sorted({p.v_freq for p in points})
+    if len(u_set) * len(v_set) != len(points):
+        return None
+    if len({(p.u_freq, p.v_freq) for p in points}) != len(points):
+        return None
+    return u_set, v_set
+
+
+def _coeffs_separable(matrix, points, u_coords, v_coords) -> np.ndarray:
+    """Row-then-column separable sampled DFT.
+
+    F[u,v] = sum_{(i,j) in nnz} exp(-2pi i (u*i/M + v*j/N))
+           = sum_i exp(-2pi i u*i/M) * (sum_{j:(i,j) in nnz} exp(-2pi i v*j/N))
+
+    Step A is K_v sparse-by-dense matvecs (cuSPARSE SpMM). Step B is one
+    dense complex GEMM (cuBLAS). Replaces the K_pts * nnz outer-product
+    work of the direct method with K_v * nnz + K_u * K_v * M.
+    """
+    rows, cols = matrix.shape
+    if not issparse(matrix):
+        matrix = csr_matrix(matrix)
+    csr = matrix.tocsr()
+    Ku, Kv = len(u_coords), len(v_coords)
+    u_idx = {u: i for i, u in enumerate(u_coords)}
+    v_idx = {v: i for i, v in enumerate(v_coords)}
+
+    M_unit = csr_matrix(
+        (np.ones(csr.nnz, dtype=np.complex64), csr.indices, csr.indptr),
+        shape=(rows, cols),
+    )
+    M_gpu = cusp.csr_matrix(M_unit)
+
+    bytes_per_g_col = 8 * rows
+    chunk_v = max(1, min(Kv, SPARSE_SEP_G_BUDGET_BYTES // max(1, bytes_per_g_col)))
+    batch_v = max(1, min(SPARSE_SEP_BATCH_V, chunk_v))
+    batch_u = max(1, min(SPARSE_SEP_BATCH_U, Ku))
+
+    j_arange = cp.arange(cols, dtype=cp.float32)
+    i_arange = cp.arange(rows, dtype=cp.float32)
+    v_arr = cp.asarray(np.asarray(v_coords, dtype=np.float32))
+    u_arr = cp.asarray(np.asarray(u_coords, dtype=np.float32))
+
+    F = cp.empty((Ku, Kv), dtype=cp.complex64)
+    for vc_start in range(0, Kv, chunk_v):
+        vc_end = min(vc_start + chunk_v, Kv)
+        nv = vc_end - vc_start
+        G = cp.empty((rows, nv), dtype=cp.complex64)
+        for vs in range(vc_start, vc_end, batch_v):
+            ve = min(vs + batch_v, vc_end)
+            e_v = cp.exp(
+                (-1j * sparse_bench.TWO_PI / float(cols))
+                * (j_arange[:, None] * v_arr[vs:ve][None, :])
+            ).astype(cp.complex64)
+            G[:, vs - vc_start:ve - vc_start] = M_gpu @ e_v
+            del e_v
+        for us in range(0, Ku, batch_u):
+            ue = min(us + batch_u, Ku)
+            E_u = cp.exp(
+                (-1j * sparse_bench.TWO_PI / float(rows))
+                * (u_arr[us:ue][:, None] * i_arange[None, :])
+            ).astype(cp.complex64)
+            F[us:ue, vc_start:vc_end] = E_u @ G
+            del E_u
+        del G
+
+    F_np = cp.asnumpy(F)
+    del F, M_gpu
+    sparse_bench.clear_gpu_memory()
+
+    coeffs = np.empty(len(points), dtype=np.complex64)
+    for k, p in enumerate(points):
+        coeffs[k] = F_np[u_idx[p.u_freq], v_idx[p.v_freq]]
+    return coeffs
+
+
+def sampled_sparse_fft_features_from_points(matrix, points, counts: dict, meta: dict, radial_bins: int, batch_size: int):
+    rows, cols = matrix.shape
+    started = time.perf_counter()
+    grid = _detect_cartesian(points)
+    if grid is not None:
+        u_coords, v_coords = grid
+        coeffs = _coeffs_separable(matrix, points, u_coords, v_coords)
+    else:
+        coeffs = _coeffs_direct(matrix, points, batch_size)
     elapsed = time.perf_counter() - started
     return sampled_features_from_coeffs(points, counts, meta, coeffs, radial_bins, elapsed)
 
