@@ -1,5 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=fft_density_analyze
+#SBATCH --account=m4243
+#SBATCH --constraint=cpu
+#SBATCH --qos=regular
+#SBATCH --nodes=1
 #SBATCH --output=logs/analyze_%j.out
 #SBATCH --error=logs/analyze_%j.err
 #SBATCH --time=01:00:00

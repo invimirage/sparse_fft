@@ -1,5 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=fft_density_eval
+#SBATCH --account=m4243_g
+#SBATCH --constraint=gpu
+#SBATCH --qos=regular
+#SBATCH --nodes=1
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
 #SBATCH --time=24:00:00
@@ -9,7 +13,8 @@
 #SBATCH --array=0-119%8
 
 set -euo pipefail
-
+module load conda
+conda activate clasp
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs results/raw full_fft_reference_cache
 

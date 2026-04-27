@@ -83,37 +83,42 @@ def select_diverse(items: list[dict], limit: int, seed: int) -> list[dict]:
     return selected
 
 
-def download_selected(output_dir: Path, selected: list[dict]) -> list[dict]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
-    for idx, item in enumerate(selected, start=1):
-        group = item["group"]
-        name = item["name"]
-        output_path = output_dir / f"{name}.mtx"
-        print(f"[{idx}/{len(selected)}] {group}/{name}", flush=True)
-        if output_path.exists():
-            rows.append(item | {"status": "exists", "path": str(output_path)})
-            print(f"  exists: {output_path}", flush=True)
-            continue
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                ssgetpy.fetch(f"{group}/{name}", location=tmpdir)
-                mtx_file = select_mtx_file(tmpdir, name)
-                if not mtx_file:
-                    rows.append(item | {"status": "missing_mtx", "path": ""})
-                    print("  no .mtx found", flush=True)
-                    continue
-                if clean_matrix(mtx_file, str(output_path)):
-                    rows.append(item | {"status": "downloaded", "path": str(output_path)})
-                    print(f"  saved: {output_path}", flush=True)
-                else:
-                    rows.append(item | {"status": "clean_failed", "path": ""})
-                    print("  clean failed", flush=True)
-        except Exception as exc:
-            rows.append(item | {"status": f"error:{type(exc).__name__}", "path": ""})
-            print(f"  error: {exc}", flush=True)
-    return rows
+import concurrent.futures
 
+def _download_single(args_tuple):
+    idx, total, item, output_dir = args_tuple
+    group = item["group"]
+    name = item["name"]
+    output_path = output_dir / f"{name}.mtx"
+    print(f"[{idx}/{total}] {group}/{name}", flush=True)
+    if output_path.exists():
+        print(f"[{idx}/{total}] exists: {output_path}", flush=True)
+        return item | {"status": "exists", "path": str(output_path)}
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ssgetpy.fetch(f"{group}/{name}", location=tmpdir)
+            mtx_file = select_mtx_file(tmpdir, name)
+            if not mtx_file:
+                print(f"[{idx}/{total}] no .mtx found", flush=True)
+                return item | {"status": "missing_mtx", "path": ""}
+            if clean_matrix(mtx_file, str(output_path)):
+                print(f"[{idx}/{total}] saved: {output_path}", flush=True)
+                return item | {"status": "downloaded", "path": str(output_path)}
+            else:
+                print(f"[{idx}/{total}] clean failed", flush=True)
+                return item | {"status": "clean_failed", "path": ""}
+    except Exception as exc:
+        print(f"[{idx}/{total}] error: {exc}", flush=True)
+        return item | {"status": f"error:{type(exc).__name__}", "path": ""}
+
+def download_selected(output_dir: Path, selected: list[dict], workers: int = 1) -> list[dict]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tasks = [(i, len(selected), item, output_dir) for i, item in enumerate(selected, start=1)]
+    if workers <= 1:
+        return [_download_single(t) for t in tasks]
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_download_single, tasks))
 
 def write_manifest(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,16 +128,14 @@ def write_manifest(path: Path, rows: list[dict]) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-
-def run_split(split: str, output_dir: Path, min_size: int, max_size: int, limit: int, seed: int, exclude: set[str]) -> list[dict]:
+def run_split(split: str, output_dir: Path, min_size: int, max_size: int, limit: int, seed: int, exclude: set[str], workers: int) -> list[dict]:
     print(f"Searching {split}: square {min_size}-{max_size}, limit={limit}", flush=True)
     candidates = search_square_candidates(min_size, max_size, exclude)
     print(f"Candidates: {len(candidates)}", flush=True)
     selected = select_diverse(candidates, limit, seed)
     print(f"Selected: {len(selected)}", flush=True)
-    downloaded = download_selected(output_dir, selected)
+    downloaded = download_selected(output_dir, selected, workers)
     return [row | {"split": split} for row in downloaded]
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download square SuiteSparse matrices for density FFT HPC experiments")
@@ -142,8 +145,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-limit", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--exclude-dir", type=Path, action="append", default=[])
+    import os
+    default_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+    parser.add_argument("--workers", type=int, default=default_workers)
     return parser.parse_args()
-
 
 def main() -> int:
     args = parse_args()
@@ -152,9 +157,9 @@ def main() -> int:
         exclude.update(existing_names(directory))
 
     rows: list[dict] = []
-    full_rows = run_split("full_eval", args.output_root / "full_eval_10k_20k", 10000, 20000, args.full_limit, args.seed, exclude)
+    full_rows = run_split("full_eval", args.output_root / "full_eval_10k_20k", 10000, 20000, args.full_limit, args.seed, exclude, args.workers)
     exclude.update(row["name"] for row in full_rows)
-    case_rows = run_split("case_study", args.output_root / "case_study_50k_100k", 50000, 100000, args.case_limit, args.seed + 1, exclude)
+    case_rows = run_split("case_study", args.output_root / "case_study_50k_100k", 50000, 100000, args.case_limit, args.seed + 1, exclude, args.workers)
     rows.extend(full_rows)
     rows.extend(case_rows)
     write_manifest(args.manifest, rows)
