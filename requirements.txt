@@ -1,0 +1,6 @@
+cupy-cuda12x
+numpy
+pandas
+scipy
+ssgetpy
+tabulate
