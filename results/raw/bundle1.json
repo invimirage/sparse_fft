@@ -1,0 +1,417 @@
+{
+  "matrix": "bundle1",
+  "path": "data/full_eval_10k_20k/bundle1.mtx",
+  "split": "manual",
+  "rows": 10581,
+  "cols": 10581,
+  "nnz": 770901,
+  "density_ratios": [
+    0.5,
+    0.375,
+    0.25,
+    0.1875,
+    0.125,
+    0.09375,
+    0.0625,
+    0.046875,
+    0.03125,
+    0.0234375,
+    0.015625,
+    0.01171875,
+    0.0078125
+  ],
+  "density_candidates": [
+    {
+      "curve_index": 0,
+      "density_ratio": 0.5,
+      "resolution": 5290
+    },
+    {
+      "curve_index": 1,
+      "density_ratio": 0.375,
+      "resolution": 3968
+    },
+    {
+      "curve_index": 2,
+      "density_ratio": 0.25,
+      "resolution": 2645
+    },
+    {
+      "curve_index": 3,
+      "density_ratio": 0.1875,
+      "resolution": 1984
+    },
+    {
+      "curve_index": 4,
+      "density_ratio": 0.125,
+      "resolution": 1323
+    },
+    {
+      "curve_index": 5,
+      "density_ratio": 0.09375,
+      "resolution": 992
+    },
+    {
+      "curve_index": 6,
+      "density_ratio": 0.0625,
+      "resolution": 661
+    },
+    {
+      "curve_index": 7,
+      "density_ratio": 0.046875,
+      "resolution": 496
+    },
+    {
+      "curve_index": 8,
+      "density_ratio": 0.03125,
+      "resolution": 331
+    },
+    {
+      "curve_index": 9,
+      "density_ratio": 0.0234375,
+      "resolution": 248
+    },
+    {
+      "curve_index": 10,
+      "density_ratio": 0.015625,
+      "resolution": 165
+    },
+    {
+      "curve_index": 11,
+      "density_ratio": 0.01171875,
+      "resolution": 124
+    },
+    {
+      "curve_index": 12,
+      "density_ratio": 0.0078125,
+      "resolution": 83
+    }
+  ],
+  "sample_fractions": [
+    0.00015625,
+    0.0003125,
+    0.000625,
+    0.00125,
+    0.0025,
+    0.005,
+    0.01
+  ],
+  "records": [
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 5290,
+      "density_ratio": 0.5,
+      "curve_index": 0,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 3968,
+      "density_ratio": 0.375,
+      "curve_index": 1,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 2645,
+      "density_ratio": 0.25,
+      "curve_index": 2,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 1984,
+      "density_ratio": 0.1875,
+      "curve_index": 3,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 1323,
+      "density_ratio": 0.125,
+      "curve_index": 4,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 992,
+      "density_ratio": 0.09375,
+      "curve_index": 5,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 661,
+      "density_ratio": 0.0625,
+      "curve_index": 6,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 496,
+      "density_ratio": 0.046875,
+      "curve_index": 7,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 331,
+      "density_ratio": 0.03125,
+      "curve_index": 8,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 248,
+      "density_ratio": 0.0234375,
+      "curve_index": 9,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 165,
+      "density_ratio": 0.015625,
+      "curve_index": 10,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 124,
+      "density_ratio": 0.01171875,
+      "curve_index": 11,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "density_fft",
+      "normalization": "all",
+      "resolution": 83,
+      "density_ratio": 0.0078125,
+      "curve_index": 12,
+      "status": "skipped:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered"
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 2,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 0,
+      "sample_fraction": 0.00015625,
+      "sample_axis_rows": 2,
+      "sample_axis_cols": 2,
+      "sample_count": 4,
+      "sample_s": 0.0002571539953351021
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 3,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 1,
+      "sample_fraction": 0.0003125,
+      "sample_axis_rows": 3,
+      "sample_axis_cols": 3,
+      "sample_count": 9,
+      "sample_s": 0.0001403801143169403
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 6,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 2,
+      "sample_fraction": 0.000625,
+      "sample_axis_rows": 6,
+      "sample_axis_cols": 6,
+      "sample_count": 36,
+      "sample_s": 0.000369807006791234
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 13,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 3,
+      "sample_fraction": 0.00125,
+      "sample_axis_rows": 13,
+      "sample_axis_cols": 13,
+      "sample_count": 169,
+      "sample_s": 0.0008622549939900637
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 26,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 4,
+      "sample_fraction": 0.0025,
+      "sample_axis_rows": 26,
+      "sample_axis_cols": 26,
+      "sample_count": 676,
+      "sample_s": 0.0016871450934559107
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 52,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 5,
+      "sample_fraction": 0.005,
+      "sample_axis_rows": 52,
+      "sample_axis_cols": 52,
+      "sample_count": 2704,
+      "sample_s": 0.007732427911832929
+    },
+    {
+      "method": "spfft_grid",
+      "normalization": "na",
+      "resolution": 105,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 6,
+      "sample_fraction": 0.01,
+      "sample_axis_rows": 105,
+      "sample_axis_cols": 105,
+      "sample_count": 11025,
+      "sample_s": 0.02685310202650726
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 2,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 0,
+      "sample_fraction": 0.00015625,
+      "sample_axis_rows": 2,
+      "sample_axis_cols": 2,
+      "sample_count": 4,
+      "sample_s": 0.0002547791227698326
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 3,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 1,
+      "sample_fraction": 0.0003125,
+      "sample_axis_rows": 3,
+      "sample_axis_cols": 3,
+      "sample_count": 9,
+      "sample_s": 0.00013109110295772552
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 6,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 2,
+      "sample_fraction": 0.000625,
+      "sample_axis_rows": 6,
+      "sample_axis_cols": 6,
+      "sample_count": 36,
+      "sample_s": 0.00018319184891879559
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 13,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 3,
+      "sample_fraction": 0.00125,
+      "sample_axis_rows": 13,
+      "sample_axis_cols": 13,
+      "sample_count": 169,
+      "sample_s": 0.00044649303890764713
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 26,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 4,
+      "sample_fraction": 0.0025,
+      "sample_axis_rows": 26,
+      "sample_axis_cols": 26,
+      "sample_count": 676,
+      "sample_s": 0.0014172098599374294
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 52,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 5,
+      "sample_fraction": 0.005,
+      "sample_axis_rows": 52,
+      "sample_axis_cols": 52,
+      "sample_count": 2704,
+      "sample_s": 0.0053938080091029406
+    },
+    {
+      "method": "sparse_direct_grid",
+      "normalization": "na",
+      "resolution": 105,
+      "status": "error:CUDARuntimeError",
+      "note": "cudaErrorIllegalAddress: an illegal memory access was encountered",
+      "curve_index": 6,
+      "sample_fraction": 0.01,
+      "sample_axis_rows": 105,
+      "sample_axis_cols": 105,
+      "sample_count": 11025,
+      "sample_s": 0.02255027904175222
+    }
+  ],
+  "hybrid_features": {
+    "density_1024_entropy_norm": 0.6729465689500262,
+    "density_1024_std": 0.07031583604607482,
+    "density_1024_gini": 0.991481707759192,
+    "density_1024_sum": 7231.919921875,
+    "density_1024_backend": "gpu",
+    "density_1024_build_s": 0.7490190169773996,
+    "density_1024_compute_s": 0.10570571199059486,
+    "density_1024_total_s": 0.855996600817889
+  },
+  "reference": {
+    "backend": "gpu",
+    "prep_s": 0.01810595695860684,
+    "fft_s": 0.06048411992378533,
+    "total_s": 0.07860209001228213,
+    "status": "ok"
+  }
+}
