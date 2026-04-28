@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
-#SBATCH --time=24:00:00
+#SBATCH --time=4:00:00
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --gres=gpu:1
@@ -36,16 +36,20 @@ python run_experiment.py \
   --sparse-methods spfft_grid,sparse_direct_grid \
   --sample-fractions 0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01 \
   --sparse-batch-size 64 \
-  --spfft-threads "${SLURM_CPUS_PER_TASK:-16}"
+  --spfft-threads "${SLURM_CPUS_PER_TASK:-16}" \
+  --skip-existing \
+  --normalization mass
 
 
-python run_experiment.py \
-  --manifest manifests/suitesparse_square_manifest.csv \
-  --matrix-index "0" \
-  --output-dir results/raw \
-  --density-ratios 0.5,0.375,0.25,0.1875,0.125,0.09375,0.0625,0.046875,0.03125,0.0234375,0.015625,0.01171875,0.0078125 \
-  --full-reference-cache full_fft_reference_cache \
-  --sparse-methods spfft_grid,sparse_direct_grid \
-  --sample-fractions 0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01 \
-  --sparse-batch-size 64 \
-  --spfft-threads "${SLURM_CPUS_PER_TASK:-16}"
+# python run_experiment.py \
+#   --manifest manifests/suitesparse_square_manifest.csv \
+#   --matrix-index "0" \
+#   --output-dir results/raw \
+#   --density-ratios 0.5,0.375,0.25,0.1875,0.125,0.09375,0.0625,0.046875,0.03125,0.0234375,0.015625,0.01171875,0.0078125 \
+#   --full-reference-cache full_fft_reference_cache \
+#   --sparse-methods spfft_grid,sparse_direct_grid \
+#   --sample-fractions 0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01 \
+#   --sparse-batch-size 64 \
+#   --spfft-threads "${SLURM_CPUS_PER_TASK:-16}" \
+#   --skip-existing \
+#   --normalization mass

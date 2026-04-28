@@ -99,23 +99,23 @@ full_eval,Simon,raefsky4,19779,19779,1316789,structural problem,downloaded,data/
 full_eval,Chen,pkustk07,16860,16860,2418804,structural problem,downloaded,data/full_eval_10k_20k/pkustk07.mtx
 full_eval,Hohn,sinc15,11532,11532,551184,materials problem,downloaded,data/full_eval_10k_20k/sinc15.mtx
 full_eval,Pothen,shuttle_eddy,10429,10429,103599,structural problem,exists,data/full_eval_10k_20k/shuttle_eddy.mtx
-case_study,Rothberg,cfd1,70656,70656,1825580,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/cfd1.mtx
-case_study,TAMU_SmartGridCenter,ACTIVSg70K,69999,69999,238627,power network problem,downloaded,data/case_study_50k_100k/ACTIVSg70K.mtx
-case_study,Andrianov,mip1,66463,66463,10352819,optimization problem,downloaded,data/case_study_50k_100k/mip1.mtx
-case_study,Oberwolfach,t3dh_e,79171,79171,4352105,duplicate model reduction problem,downloaded,data/case_study_50k_100k/t3dh_e.mtx
-case_study,Koutsovasilis,F2,71505,71505,5294285,structural problem,downloaded,data/case_study_50k_100k/F2.mtx
-case_study,TKK,s4dkt3m2,90449,90449,3753461,structural problem,downloaded,data/case_study_50k_100k/s4dkt3m2.mtx
-case_study,Schenk_IBMSDS,ibm_matrix_2,51448,51448,537038,semiconductor device problem,downloaded,data/case_study_50k_100k/ibm_matrix_2.mtx
-case_study,Lee,fem_filter,74062,74062,1731206,electromagnetics problem,downloaded,data/case_study_50k_100k/fem_filter.mtx
-case_study,Chen,pkustk11,87804,87804,5217912,structural problem,downloaded,data/case_study_50k_100k/pkustk11.mtx
-case_study,GHS_psdef,s3dkq4m2,90449,90449,4427725,structural problem,downloaded,data/case_study_50k_100k/s3dkq4m2.mtx
-case_study,FEMLAB,poisson3Db,85623,85623,2374949,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/poisson3Db.mtx
-case_study,Cunningham,qa8fk,66127,66127,1660579,acoustics problem,downloaded,data/case_study_50k_100k/qa8fk.mtx
-case_study,Sanghavi,ecl32,51993,51993,380415,semiconductor device problem,downloaded,data/case_study_50k_100k/ecl32.mtx
-case_study,Averous,epb3,84617,84617,463625,thermal problem,downloaded,data/case_study_50k_100k/epb3.mtx
-case_study,Goodwin,Goodwin_071,56021,56021,1797934,computational fluid dynamics,downloaded,data/case_study_50k_100k/Goodwin_071.mtx
-case_study,Chevron,Chevron2,90249,90249,803173,other problem,downloaded,data/case_study_50k_100k/Chevron2.mtx
-case_study,FlowIPM22,uni_chimera_i3,100000,100000,499696,undirected weighted graph,downloaded,data/case_study_50k_100k/uni_chimera_i3.mtx
-case_study,MaxPlanck,shallow_water2,81920,81920,327680,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/shallow_water2.mtx
-case_study,Castrillon,denormal,89400,89400,1156224,counter-example problem,downloaded,data/case_study_50k_100k/denormal.mtx
-case_study,VLSI,nv1,75468,75468,1635003,semiconductor device problem,downloaded,data/case_study_50k_100k/nv1.mtx
+full_eval,Rothberg,cfd1,70656,70656,1825580,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/cfd1.mtx
+full_eval,TAMU_SmartGridCenter,ACTIVSg70K,69999,69999,238627,power network problem,downloaded,data/case_study_50k_100k/ACTIVSg70K.mtx
+full_eval,Andrianov,mip1,66463,66463,10352819,optimization problem,downloaded,data/case_study_50k_100k/mip1.mtx
+full_eval,Oberwolfach,t3dh_e,79171,79171,4352105,duplicate model reduction problem,downloaded,data/case_study_50k_100k/t3dh_e.mtx
+full_eval,Koutsovasilis,F2,71505,71505,5294285,structural problem,downloaded,data/case_study_50k_100k/F2.mtx
+full_eval,TKK,s4dkt3m2,90449,90449,3753461,structural problem,downloaded,data/case_study_50k_100k/s4dkt3m2.mtx
+full_eval,Schenk_IBMSDS,ibm_matrix_2,51448,51448,537038,semiconductor device problem,downloaded,data/case_study_50k_100k/ibm_matrix_2.mtx
+full_eval,Lee,fem_filter,74062,74062,1731206,electromagnetics problem,downloaded,data/case_study_50k_100k/fem_filter.mtx
+full_eval,Chen,pkustk11,87804,87804,5217912,structural problem,downloaded,data/case_study_50k_100k/pkustk11.mtx
+full_eval,GHS_psdef,s3dkq4m2,90449,90449,4427725,structural problem,downloaded,data/case_study_50k_100k/s3dkq4m2.mtx
+full_eval,FEMLAB,poisson3Db,85623,85623,2374949,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/poisson3Db.mtx
+full_eval,Cunningham,qa8fk,66127,66127,1660579,acoustics problem,downloaded,data/case_study_50k_100k/qa8fk.mtx
+full_eval,Sanghavi,ecl32,51993,51993,380415,semiconductor device problem,downloaded,data/case_study_50k_100k/ecl32.mtx
+full_eval,Averous,epb3,84617,84617,463625,thermal problem,downloaded,data/case_study_50k_100k/epb3.mtx
+full_eval,Goodwin,Goodwin_071,56021,56021,1797934,computational fluid dynamics,downloaded,data/case_study_50k_100k/Goodwin_071.mtx
+full_eval,Chevron,Chevron2,90249,90249,803173,other problem,downloaded,data/case_study_50k_100k/Chevron2.mtx
+full_eval,FlowIPM22,uni_chimera_i3,100000,100000,499696,undirected weighted graph,downloaded,data/case_study_50k_100k/uni_chimera_i3.mtx
+full_eval,MaxPlanck,shallow_water2,81920,81920,327680,computational fluid dynamics problem,downloaded,data/case_study_50k_100k/shallow_water2.mtx
+full_eval,Castrillon,denormal,89400,89400,1156224,counter-example problem,downloaded,data/case_study_50k_100k/denormal.mtx
+full_eval,VLSI,nv1,75468,75468,1635003,semiconductor device problem,downloaded,data/case_study_50k_100k/nv1.mtx

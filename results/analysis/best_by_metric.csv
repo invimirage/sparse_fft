@@ -1,0 +1,6 @@
+split,metric,best_method,best_normalization,best_resolution,mean_error
+full_eval,log_mae_interp,sparse_direct_grid,na,1108,0.5731019973754883
+full_eval,entropy_error_interp,density_fft,none,4156,0.0027618408203125
+full_eval,entropy_error_direct,sparse_direct_grid,na,2,1.1920928955078125e-07
+full_eval,radial_error_interp,sparse_direct_grid,na,1108,7.361779386599562e-05
+full_eval,radial_error_direct,sparse_direct_grid,na,2,0.0

@@ -578,7 +578,7 @@ def density_work_bytes(out_size: int) -> int:
     return cells * (4 + 8 + 8 + 4 + 4)
 
 
-def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
+def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...]) -> list[dict]:
     if density_work_bytes(out_size) > DENSITY_MAX_WORK_BYTES:
         return [{"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
     try:
@@ -589,7 +589,7 @@ def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, densit
     density = to_gpu(density)
     rows, cols = matrix.shape
     records: list[dict] = []
-    for norm in NORMALIZATIONS:
+    for norm in normalizations:
         started = time.perf_counter()
         normalized = normalize_density(density, int(matrix.nnz), norm)
         small_log, fft_s = density_fft_log_spectrum(normalized)
@@ -721,6 +721,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("results/raw"))
     parser.add_argument("--resolutions", default="", help="Legacy fixed density sizes. If set, these are run in addition to --density-ratios")
     parser.add_argument("--density-ratios", default=DENSITY_RATIOS_DEFAULT, help="Comma-separated density map ratios scanned from large to small; default max is 0.5")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip if the output JSON already exists for this matrix")
+    parser.add_argument("--normalization", choices=["all", "none", "mass", "unit"], default="all", help="Which normalization to execute (default: all)")
     parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid")
     parser.add_argument("--sample-fraction", type=float, default=0.01, help="Legacy single sparse grid axis fraction, used only if --sample-fractions is empty")
     parser.add_argument("--sample-fractions", default="0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01", help="Comma-separated sparse grid axis fractions for error-vs-time curves")
@@ -746,6 +748,12 @@ def main() -> int:
         matrix_path = args.matrix
         split = args.split
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = args.output_dir / f"{matrix_path.stem}.json"
+    if args.skip_existing and out_path.exists():
+        print(f"Skipping {matrix_path.stem}, output {out_path} already exists.", flush=True)
+        return 0
+
     matrix = bench.load_binary_coo(matrix_path)
     rows, cols = matrix.shape
     if rows != cols:
@@ -765,6 +773,7 @@ def main() -> int:
         if res not in seen_sizes:
             density_candidates.append((len(density_candidates), float(res) / float(min(rows, cols)), res))
     sample_fractions = parse_float_list(args.sample_fractions) if args.sample_fractions.strip() else [args.sample_fraction]
+    sample_fractions.sort(reverse=True)  # 从大到小跑，如果大的 OOM 报错，后面小的还可以继续尝试
     output = {
         "matrix": matrix_path.stem,
         "path": str(matrix_path),
@@ -793,7 +802,8 @@ def main() -> int:
 
     for curve_index, density_ratio, out_size in density_candidates:
         try:
-            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index))
+            norms_to_run = NORMALIZATIONS if args.normalization == "all" else (args.normalization,)
+            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run))
         except Exception as exc:
             output["records"].append({"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"error:{type(exc).__name__}", "note": str(exc)})
             clear_gpu()
