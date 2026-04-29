@@ -7,7 +7,7 @@ This folder is a batch-job version of the current sparse FFT project for SuiteSp
 The pipeline has three stages:
 
 1. `download_square_matrices.py` downloads and cleans SuiteSparse square matrices.
-2. `run_experiment.py` evaluates full FFT reference, density-map FFT normalization variants, two sparse FFT grid methods, and sparse error-vs-time curves across multiple sampling budgets.
+2. `run_experiment.py` evaluates full FFT reference, density-map/compression FFT normalization variants, sparse FFT grid methods, and sparse error-vs-time curves across multiple sampling budgets.
 3. `analyze_results.py` merges JSON outputs and writes CSV/Markdown summaries.
 
 Datasets:
@@ -27,10 +27,18 @@ Normalization methods:
 - `mass`: `D * sum(X) / sum(D)`
 - `unit`: `D / sum(D)`
 
+Compression baselines:
+
+- `density_fft`: density/average pooled map with existing normalizations.
+- `avg_pool_fft`, `max_pool_fft`, `nearest_downsample_fft`, `gaussian_compression_fft`: spatial compression baselines using `mass` normalization.
+
 Sparse FFT comparison methods:
 
 - `spfft_grid`: existing pruned SpFFT/JL-style rectangular frequency grid, GPU-assisted when possible, CPU fallback.
 - `sparse_direct_grid`: existing direct sparse DFT on the same rectangular frequency grid, batched on GPU.
+- `finufft_grid`: optional FINUFFT type-3 evaluation on the same sampled frequency grid.
+- `cufinufft_grid`: optional cuFINUFFT evaluation when available, falling back to FINUFFT.
+- `fps_sft` and `kapralov_sfft`: optional external baselines; currently skipped unless adapters/dependencies are configured.
 
 Sparse curve sampling budgets:
 
@@ -119,4 +127,6 @@ Outputs:
 
 - The scripts import existing utilities from `../sparse_fft`; the original project files are not modified.
 - If `libspfft.so` is not in the Python environment library path, set `SPFFT_LIBRARY_PATH` before submitting.
+- Optional baselines require `finufft`/`cufinufft`; `fps_sft` requires an Octave/MATLAB adapter, and `kapralov_sfft` requires a compiled FFTW3-based external adapter.
+- See `BASELINE_INSTALL.md` for baseline installation, current support status, and smoke-test commands.
 - If an HPC partition uses different directives, edit `#SBATCH --gres=gpu:1`, memory, time, or array throttling in the `.sbatch` files.

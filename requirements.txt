@@ -1,4 +1,6 @@
 cupy-cuda12x
+cufinufft
+finufft
 numpy
 pandas
 scipy

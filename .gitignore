@@ -1,3 +1,7 @@
 data/
 sparse_methods/__pycache__/*
 __pycache__/*
+results/*
+manifests/*
+*.pyc
+full_fft_reference_cache/*

@@ -27,7 +27,9 @@ def sampled_features_from_coeffs(points, counts: dict, meta: dict, coeffs: np.nd
     for idx, point in enumerate(points):
         radius = math.sqrt(point.u_shift ** 2 + point.v_shift ** 2)
         bin_id = min(int((radius / r_max) * radial_bins), radial_bins - 1) if r_max > 0 else 0
-        energy = float(abs(coeffs[idx]) ** 2)
+        # Match run_experiment.py reference radial metrics, which use log1p(|FFT|)
+        # as the radial-bin weight rather than power spectrum energy.
+        energy = float(np.log1p(abs(coeffs[idx])))
         total_weight = point.weight * point.multiplicity
         weighted_energy = total_weight * energy
         sample_energy[idx] = weighted_energy

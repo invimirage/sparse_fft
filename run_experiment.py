@@ -48,6 +48,8 @@ from sparse_methods import sparse_sampling, spfft as spfft_method  # noqa: E402
 
 RADIAL_BINS = 16
 NORMALIZATIONS = ("none", "mass", "unit")
+COMPRESSION_METHODS = ("density_fft", "avg_pool_fft", "max_pool_fft", "nearest_downsample_fft", "gaussian_compression_fft")
+COMPRESSION_BASELINE_NORMALIZATIONS = ("mass",)
 DENSITY_RATIOS_DEFAULT = "0.5,0.375,0.25,0.1875,0.125,0.09375,0.0625,0.046875,0.03125,0.0234375,0.015625,0.01171875,0.0078125"
 DIRECT_FULL_FFT_ELEMENTS = int(float(os.environ.get("DIRECT_FULL_FFT_ELEMENTS", "4.5e8")))
 DENSITY_MAX_WORK_BYTES = int(float(os.environ.get("DENSITY_MAX_WORK_BYTES", str(6 * 1024**3))))
@@ -83,12 +85,20 @@ def parse_float_list(text: str) -> list[float]:
     return [float(item) for item in text.split(",") if item.strip()]
 
 
-def load_manifest_row(path: Path, index: int) -> dict:
+def _load_manifest_rows(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8", newline="") as handle:
-        rows = [row for row in csv.DictReader(handle) if row.get("path") and row.get("status") in {"downloaded", "exists"}]
+        return [row for row in csv.DictReader(handle) if row.get("path") and row.get("status") in {"downloaded", "exists"}]
+
+
+def load_manifest_row(path: Path, index: int) -> dict:
+    rows = _load_manifest_rows(path)
     if index < 0 or index >= len(rows):
         raise IndexError(f"matrix index {index} outside manifest range 0..{len(rows) - 1}")
     return rows[index]
+
+
+def load_manifest_all(path: Path) -> list[dict]:
+    return _load_manifest_rows(path)
 
 
 def density_map_gpu(matrix, out_size: int):
@@ -130,6 +140,81 @@ def density_map_cpu(matrix, out_size: int):
     col_sizes = np.maximum(col_edges[1:] - col_edges[:-1], 1).astype(np.float32)
     density = counts / (row_sizes[:, None] * col_sizes[None, :])
     return density, time.perf_counter() - started, "cpu"
+
+
+def avg_pool_compression(matrix, out_size: int):
+    density, elapsed, backend = density_map_gpu(matrix, out_size)
+    return density, elapsed, backend
+
+
+def max_pool_compression(matrix, out_size: int):
+    coo = matrix.tocoo(copy=False)
+    rows, cols = coo.shape
+    started = time.perf_counter()
+    rb = np.minimum((coo.row.astype(np.int64, copy=False) * out_size) // rows, out_size - 1)
+    cb = np.minimum((coo.col.astype(np.int64, copy=False) * out_size) // cols, out_size - 1)
+    grid = np.zeros((out_size, out_size), dtype=np.float32)
+    grid[rb, cb] = 1.0
+    return grid, time.perf_counter() - started, "cpu"
+
+
+def nearest_downsample_compression(matrix, out_size: int):
+    csr = matrix.tocsr(copy=False)
+    rows, cols = csr.shape
+    started = time.perf_counter()
+    row_pos = np.clip(np.rint((np.arange(out_size, dtype=np.float64) + 0.5) * rows / out_size - 0.5).astype(np.int64), 0, rows - 1)
+    col_pos = np.clip(np.rint((np.arange(out_size, dtype=np.float64) + 0.5) * cols / out_size - 0.5).astype(np.int64), 0, cols - 1)
+    grid = np.zeros((out_size, out_size), dtype=np.float32)
+    for out_r, src_r in enumerate(row_pos.tolist()):
+        left = csr.indptr[src_r]
+        right = csr.indptr[src_r + 1]
+        if right <= left:
+            continue
+        cols_in_row = csr.indices[left:right]
+        hits = np.isin(col_pos, cols_in_row, assume_unique=False)
+        grid[out_r, hits] = 1.0
+    return grid, time.perf_counter() - started, "cpu"
+
+
+def gaussian_compression(matrix, out_size: int, sigma: float = 0.75, radius: int = 2):
+    coo = matrix.tocoo(copy=False)
+    rows, cols = coo.shape
+    started = time.perf_counter()
+    r_scaled = (coo.row.astype(np.float64, copy=False) + 0.5) * out_size / float(rows) - 0.5
+    c_scaled = (coo.col.astype(np.float64, copy=False) + 0.5) * out_size / float(cols) - 0.5
+    r0 = np.floor(r_scaled).astype(np.int64)
+    c0 = np.floor(c_scaled).astype(np.int64)
+    grid = np.zeros((out_size, out_size), dtype=np.float32)
+    for dr in range(-radius, radius + 1):
+        rr = r0 + dr
+        valid_r = (rr >= 0) & (rr < out_size)
+        if not np.any(valid_r):
+            continue
+        wr = np.exp(-0.5 * ((rr.astype(np.float64, copy=False) - r_scaled) / sigma) ** 2)
+        for dc in range(-radius, radius + 1):
+            cc = c0 + dc
+            valid = valid_r & (cc >= 0) & (cc < out_size)
+            if not np.any(valid):
+                continue
+            wc = np.exp(-0.5 * ((cc.astype(np.float64, copy=False) - c_scaled) / sigma) ** 2)
+            w = wr * wc
+            np.add.at(grid, (rr[valid], cc[valid]), w[valid].astype(np.float32, copy=False))
+    total = float(grid.sum(dtype=np.float64))
+    if total > 0.0:
+        grid *= float(coo.nnz) / total
+    return grid, time.perf_counter() - started, "cpu"
+
+
+def compression_map(matrix, out_size: int, method: str):
+    if method in {"density_fft", "avg_pool_fft"}:
+        return avg_pool_compression(matrix, out_size)
+    if method == "max_pool_fft":
+        return max_pool_compression(matrix, out_size)
+    if method == "nearest_downsample_fft":
+        return nearest_downsample_compression(matrix, out_size)
+    if method == "gaussian_compression_fft":
+        return gaussian_compression(matrix, out_size)
+    raise ValueError(f"unknown compression method: {method}")
 
 
 def normalize_density(density, nnz: int, mode: str):
@@ -573,23 +658,45 @@ def direct_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
     return out
 
 
+def sampled_radial_error(ref_metrics: dict, features: dict) -> float:
+    ref_radial = np.asarray(ref_metrics.get("full_radial", []), dtype=np.float64)
+    sampled_radial = np.asarray(features.get("radial", []), dtype=np.float64)
+    if ref_radial.size == 0 or sampled_radial.size == 0 or ref_radial.shape != sampled_radial.shape:
+        return math.nan
+    return float(np.mean(np.abs(ref_radial - sampled_radial)))
+
+
+def sampled_entropy_error(ref_metrics: dict, features: dict) -> float:
+    sample_count = int(features.get("sample_count") or 0)
+    spectral_points = int(features.get("spectral_points") or 0)
+    if sample_count <= 1 or spectral_points <= 1:
+        return math.nan
+    ref_entropy = float(ref_metrics.get("full_entropy", math.nan))
+    sampled_entropy = float(features.get("entropy", math.nan))
+    if not math.isfinite(ref_entropy) or not math.isfinite(sampled_entropy):
+        return math.nan
+    ref_entropy_norm = ref_entropy / math.log(float(spectral_points))
+    sampled_entropy_norm = sampled_entropy / math.log(float(sample_count))
+    return abs(ref_entropy_norm - sampled_entropy_norm)
+
+
 def density_work_bytes(out_size: int) -> int:
     cells = int(out_size) * int(out_size)
     return cells * (4 + 8 + 8 + 4 + 4)
 
 
-def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
+def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
     if density_work_bytes(out_size) > DENSITY_MAX_WORK_BYTES:
-        return [{"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
+        return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
     try:
-        density, compress_s, compress_backend = density_map_gpu(matrix, out_size)
+        density, compress_s, compress_backend = compression_map(matrix, out_size, method)
     except Exception as exc:
         clear_gpu()
-        return [{"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"skipped:{type(exc).__name__}", "note": str(exc)}]
+        return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"skipped:{type(exc).__name__}", "note": str(exc)}]
     density = to_gpu(density)
-    rows, cols = matrix.shape
     records: list[dict] = []
-    for norm in NORMALIZATIONS:
+    normalizations = NORMALIZATIONS if method == "density_fft" else COMPRESSION_BASELINE_NORMALIZATIONS
+    for norm in normalizations:
         started = time.perf_counter()
         normalized = normalize_density(density, int(matrix.nnz), norm)
         small_log, fft_s = density_fft_log_spectrum(normalized)
@@ -601,7 +708,7 @@ def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, densit
         interp_s = time.perf_counter() - interp_started
 
         row = {
-            "method": "density_fft",
+            "method": method,
             "normalization": norm,
             "resolution": out_size,
             "density_ratio": density_ratio,
@@ -621,6 +728,13 @@ def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, densit
     return records
 
 
+def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
+    records: list[dict] = []
+    for method in COMPRESSION_METHODS:
+        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index))
+    return records
+
+
 def grid_log_from_coeffs(points, coeffs: np.ndarray) -> np.ndarray:
     row_coords = sorted({point.u_shift for point in points})
     col_coords = sorted({point.v_shift for point in points})
@@ -633,6 +747,49 @@ def grid_log_from_coeffs(points, coeffs: np.ndarray) -> np.ndarray:
     return grid
 
 
+def finufft_grid_features(matrix, points, counts: dict, meta: dict, radial_bins: int, prefer_gpu: bool = False):
+    coo = matrix.tocoo(copy=False)
+    rows, cols = coo.shape
+    started = time.perf_counter()
+    backend = "finufft_cpu"
+    if prefer_gpu:
+        try:
+            import cufinufft  # type: ignore
+            if hasattr(cufinufft, "nufft2d3"):
+                x_gpu = cp.asarray((bench.TWO_PI * coo.row.astype(np.float64, copy=False)) / float(rows))
+                y_gpu = cp.asarray((bench.TWO_PI * coo.col.astype(np.float64, copy=False)) / float(cols))
+                c_gpu = cp.ones(coo.nnz, dtype=cp.complex64)
+                s_gpu = cp.asarray(np.array([point.u_freq for point in points], dtype=np.float64))
+                t_gpu = cp.asarray(np.array([point.v_freq for point in points], dtype=np.float64))
+                coeffs_gpu = cufinufft.nufft2d3(x_gpu, y_gpu, c_gpu, s_gpu, t_gpu, isign=-1, eps=1e-5)
+                sync()
+                coeffs = cp.asnumpy(coeffs_gpu).astype(np.complex64, copy=False)
+                elapsed = time.perf_counter() - started
+                result = sparse_sampling.sampled_features_from_coeffs(points, counts, meta, coeffs, radial_bins, elapsed)
+                result["backend"] = "cufinufft_gpu"
+                return result
+        except ImportError:
+            pass
+        except Exception:
+            clear_gpu()
+
+    try:
+        import finufft  # type: ignore
+    except ImportError as exc:
+        raise ImportError("install finufft or cufinufft to enable finufft_grid/cufinufft_grid") from exc
+
+    x = (bench.TWO_PI * coo.row.astype(np.float64, copy=False)) / float(rows)
+    y = (bench.TWO_PI * coo.col.astype(np.float64, copy=False)) / float(cols)
+    c = np.ones(coo.nnz, dtype=np.complex128)
+    s = np.array([point.u_freq for point in points], dtype=np.float64)
+    t = np.array([point.v_freq for point in points], dtype=np.float64)
+    coeffs = finufft.nufft2d3(x, y, c, s, t, isign=-1, eps=1e-9).astype(np.complex64, copy=False)
+    elapsed = time.perf_counter() - started
+    result = sparse_sampling.sampled_features_from_coeffs(points, counts, meta, coeffs, radial_bins, elapsed)
+    result["backend"] = backend
+    return result
+
+
 def sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: int, threads: int, spfft_library: str | None):
     if method == "spfft_grid":
         try:
@@ -642,6 +799,14 @@ def sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: 
             return spfft_method.spfft_jl_features_cpu(matrix, points, counts, meta, RADIAL_BINS), "cpu_pruned"
     if method == "sparse_direct_grid":
         return sparse_sampling.sampled_sparse_fft_features_from_points(matrix, points, counts, meta, RADIAL_BINS, batch_size), "gpu_direct"
+    if method == "finufft_grid":
+        features = finufft_grid_features(matrix, points, counts, meta, RADIAL_BINS, prefer_gpu=False)
+        return features, features.get("backend", "finufft_cpu")
+    if method == "cufinufft_grid":
+        features = finufft_grid_features(matrix, points, counts, meta, RADIAL_BINS, prefer_gpu=True)
+        return features, features.get("backend", "finufft_cpu")
+    if method in {"fps_sft", "kapralov_sfft"}:
+        raise ImportError(f"{method} external adapter is not configured in this environment")
     raise ValueError(method)
 
 
@@ -672,6 +837,8 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
         if reference is not None:
             metric_updates.update(interpolated_metrics(reference, ref_metrics, grid))
             metric_updates.update(direct_metrics(reference, ref_metrics, grid))
+            metric_updates["entropy_error_direct"] = sampled_entropy_error(ref_metrics, features)
+            metric_updates["radial_error_direct"] = sampled_radial_error(ref_metrics, features)
         interp_s = time.perf_counter() - interp_started
         row = {
             "method": method,
@@ -692,6 +859,9 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
         row.update(metric_updates)
         del grid
         return row
+    except ImportError as exc:
+        clear_gpu()
+        return {"method": method, "normalization": "na", "resolution": row_count, "status": "skipped:dependency_missing", "note": str(exc), "curve_index": curve_index, "sample_fraction": sample_fraction, "sample_axis_rows": len(row_coords), "sample_axis_cols": len(col_coords), "sample_count": len(points), "sample_s": sample_s}
     except Exception as exc:
         clear_gpu()
         return {"method": method, "normalization": "na", "resolution": row_count, "status": f"error:{type(exc).__name__}", "note": str(exc), "curve_index": curve_index, "sample_fraction": sample_fraction, "sample_axis_rows": len(row_coords), "sample_axis_cols": len(col_coords), "sample_count": len(points), "sample_s": sample_s}
@@ -715,13 +885,14 @@ def json_ready(value):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one HPC density FFT normalization benchmark")
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--matrix-index", type=int)
+    parser.add_argument("--matrix-index", type=str, help="Integer index into manifest, or 'all' to iterate every valid row")
     parser.add_argument("--matrix", type=Path)
+    parser.add_argument("--skip-existing", action="store_true", help="When --matrix-index=all, skip matrices whose output JSON already exists")
     parser.add_argument("--split", default="manual")
     parser.add_argument("--output-dir", type=Path, default=Path("results/raw"))
     parser.add_argument("--resolutions", default="", help="Legacy fixed density sizes. If set, these are run in addition to --density-ratios")
     parser.add_argument("--density-ratios", default=DENSITY_RATIOS_DEFAULT, help="Comma-separated density map ratios scanned from large to small; default max is 0.5")
-    parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid")
+    parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid,finufft_grid,cufinufft_grid,fps_sft,kapralov_sfft")
     parser.add_argument("--sample-fraction", type=float, default=0.01, help="Legacy single sparse grid axis fraction, used only if --sample-fractions is empty")
     parser.add_argument("--sample-fractions", default="0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01", help="Comma-separated sparse grid axis fractions for error-vs-time curves")
     parser.add_argument("--sparse-batch-size", type=int, default=64)
@@ -733,19 +904,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    add_sparse_fft_root(args.sparse_fft_root)
-    if args.matrix is None:
-        if args.manifest is None or args.matrix_index is None:
-            raise SystemExit("Provide --matrix or both --manifest and --matrix-index")
-        manifest_row = load_manifest_row(args.manifest, args.matrix_index)
-        matrix_path = Path(manifest_row["path"])
-        split = manifest_row.get("split") or args.split
-    else:
-        matrix_path = args.matrix
-        split = args.split
-
+def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> Path:
     matrix = bench.load_binary_coo(matrix_path)
     rows, cols = matrix.shape
     if rows != cols:
@@ -810,6 +969,57 @@ def main() -> int:
     with out_path.open("w", encoding="utf-8") as handle:
         json.dump(output, handle, indent=2, default=json_ready)
     print(f"Wrote {out_path}", flush=True)
+    return out_path
+
+
+def main() -> int:
+    args = parse_args()
+    add_sparse_fft_root(args.sparse_fft_root)
+
+    if args.matrix is not None:
+        run_one_matrix(args.matrix, args.split, args)
+        return 0
+
+    if args.manifest is None or args.matrix_index is None:
+        raise SystemExit("Provide --matrix or both --manifest and --matrix-index")
+
+    if str(args.matrix_index).lower() == "all":
+        rows = load_manifest_all(args.manifest)
+        total = len(rows)
+        if total == 0:
+            raise SystemExit(f"manifest {args.manifest} has no usable rows")
+        print(f"[all] running {total} matrices from {args.manifest}", flush=True)
+        failures: list[tuple[int, str, str]] = []
+        for idx, row in enumerate(rows):
+            matrix_path = Path(row["path"])
+            split = row.get("split") or args.split
+            out_path = args.output_dir / f"{matrix_path.stem}.json"
+            if args.skip_existing and out_path.exists():
+                print(f"[{idx + 1}/{total}] skip {matrix_path.stem} (output exists)", flush=True)
+                continue
+            print(f"[{idx + 1}/{total}] {matrix_path.stem} ({matrix_path})", flush=True)
+            try:
+                run_one_matrix(matrix_path, split, args)
+            except Exception as exc:
+                clear_gpu()
+                failures.append((idx, matrix_path.stem, f"{type(exc).__name__}: {exc}"))
+                print(f"[{idx + 1}/{total}] FAILED {matrix_path.stem}: {type(exc).__name__}: {exc}", flush=True)
+        if failures:
+            print(f"\n[all] done with {len(failures)} failures:", flush=True)
+            for idx, name, msg in failures:
+                print(f"  index={idx} matrix={name} error={msg}", flush=True)
+            return 1
+        print(f"\n[all] done — all {total} matrices succeeded", flush=True)
+        return 0
+
+    try:
+        index = int(args.matrix_index)
+    except ValueError:
+        raise SystemExit(f"--matrix-index must be an integer or 'all', got {args.matrix_index!r}")
+    manifest_row = load_manifest_row(args.manifest, index)
+    matrix_path = Path(manifest_row["path"])
+    split = manifest_row.get("split") or args.split
+    run_one_matrix(matrix_path, split, args)
     return 0
 
 
