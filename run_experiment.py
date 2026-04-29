@@ -436,6 +436,7 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
     row_started = time.perf_counter()
     for start in range(0, rows, row_batch):
         stop = min(start + row_batch, rows)
+        print(f"reference row FFT {matrix_path.stem}: starting rows {start}:{stop}/{rows}", flush=True)
         dense_block = np.zeros((stop - start, cols), dtype=np.float32)
         for local_row, global_row in enumerate(range(start, stop)):
             left = matrix.indptr[global_row]
@@ -450,9 +451,10 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
         del row_chunk
         del dense_gpu, fft_block, dense_block
         clear_gpu()
-        print(f"reference row FFT {matrix_path.stem}: {stop}/{rows}", flush=True)
+        print(f"reference row FFT {matrix_path.stem}: finished rows {stop}/{rows}", flush=True)
 
     for start, stop in chunk_ranges(rows, chunk_rows):
+        print(f"reference mag chunks {matrix_path.stem}: allocating rows {start}:{stop}/{rows}", flush=True)
         mag_chunk = np.memmap(mag_chunk_path(mag_dir, start, stop), dtype=np.float32, mode="w+", shape=(stop - start, cols))
         mag_chunk.flush()
         del mag_chunk
@@ -462,6 +464,7 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
     col_started = time.perf_counter()
     for start in range(0, cols, col_batch):
         stop = min(start + col_batch, cols)
+        print(f"reference col FFT {matrix_path.stem}: starting cols {start}:{stop}/{cols}", flush=True)
         block = np.empty((rows, stop - start), dtype=np.complex64)
         for row_start in range(0, rows, row_batch):
             row_stop = min(row_start + row_batch, rows)
@@ -481,7 +484,7 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
             del mag_chunk
         del block, block_gpu, fft_block, abs_block
         clear_gpu()
-        print(f"reference col FFT {matrix_path.stem}: {stop}/{cols}", flush=True)
+        print(f"reference col FFT {matrix_path.stem}: finished cols {stop}/{cols}", flush=True)
 
     meta = {
         "rows": rows,
