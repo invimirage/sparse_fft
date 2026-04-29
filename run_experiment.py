@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Iterable
 
@@ -56,6 +57,7 @@ DENSITY_MAX_WORK_BYTES = int(float(os.environ.get("DENSITY_MAX_WORK_BYTES", str(
 REF_ROW_BATCH_CAP = int(os.environ.get("REF_ROW_BATCH_CAP", "4096"))
 REF_COL_BATCH_CAP = int(os.environ.get("REF_COL_BATCH_CAP", "2048"))
 REF_GPU_WORK_BYTES = int(float(os.environ.get("REF_GPU_WORK_BYTES", str(8 * 1024**3))))
+REF_MAG_CHUNK_ROWS = int(os.environ.get("REF_MAG_CHUNK_ROWS", "10000"))
 METRIC_ROW_BLOCK = int(os.environ.get("METRIC_ROW_BLOCK", "512"))
 METRIC_COL_BLOCK = int(os.environ.get("METRIC_COL_BLOCK", "2048"))
 
@@ -87,6 +89,15 @@ def parse_float_list(text: str) -> list[float]:
 
 def mean_seconds(samples: list[float]) -> float:
     return float(np.mean(samples)) if samples else math.nan
+
+
+def timing_runs(warmup: int, repeat: int) -> int:
+    return int(warmup) + int(repeat)
+
+
+def print_timing_progress(args: argparse.Namespace, message: str) -> None:
+    if timing_runs(args.timing_warmup, args.timing_repeat) > 1:
+        print(message, flush=True)
 
 
 def timed_compression_map(matrix, out_size: int, method: str, warmup: int, repeat: int):
@@ -335,6 +346,66 @@ def estimate_ref_col_batch(rows: int) -> int:
     return max(1, min(REF_COL_BATCH_CAP, int(REF_GPU_WORK_BYTES // max(per_col_bytes, 1))))
 
 
+def chunk_ranges(size: int, chunk_size: int):
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, size, chunk_size):
+        yield start, min(start + chunk_size, size)
+
+
+def mag_chunk_path(mag_dir: Path, row_start: int, row_stop: int) -> Path:
+    return mag_dir / f"rows_{row_start:08d}_{row_stop:08d}.float32.dat"
+
+
+def row_fft_chunk_path(row_dir: Path, row_start: int, row_stop: int) -> Path:
+    return row_dir / f"rows_{row_start:08d}_{row_stop:08d}.complex64.dat"
+
+
+def load_reference_mag_block(reference: dict, row_start: int, row_stop: int, col_start: int, col_stop: int) -> np.ndarray:
+    rows, cols = reference["rows"], reference["cols"]
+    if reference["kind"] == "memmap":
+        mag = np.memmap(reference["mag_path"], dtype=np.float32, mode="r", shape=(rows, cols))
+        block = np.asarray(mag[row_start:row_stop, col_start:col_stop], dtype=np.float32).copy()
+        del mag
+        return block
+
+    mag_dir = Path(reference["mag_dir"])
+    chunk_rows = int(reference.get("chunk_rows", REF_MAG_CHUNK_ROWS))
+    pieces = []
+    current = row_start
+    while current < row_stop:
+        chunk_start = (current // chunk_rows) * chunk_rows
+        chunk_stop = min(chunk_start + chunk_rows, rows)
+        take_stop = min(row_stop, chunk_stop)
+        path = mag_chunk_path(mag_dir, chunk_start, chunk_stop)
+        chunk = np.memmap(path, dtype=np.float32, mode="r", shape=(chunk_stop - chunk_start, cols))
+        pieces.append(np.asarray(chunk[current - chunk_start:take_stop - chunk_start, col_start:col_stop], dtype=np.float32).copy())
+        del chunk
+        current = take_stop
+    return np.vstack(pieces) if len(pieces) > 1 else pieces[0]
+
+
+def load_reference_mag_points(reference: dict, row_idx: np.ndarray, col_idx: np.ndarray) -> np.ndarray:
+    rows, cols = reference["rows"], reference["cols"]
+    if reference["kind"] == "memmap":
+        mag = np.memmap(reference["mag_path"], dtype=np.float32, mode="r", shape=(rows, cols))
+        out = np.asarray(mag[np.ix_(row_idx, col_idx)], dtype=np.float32).copy()
+        del mag
+        return out
+
+    out = np.empty((len(row_idx), len(col_idx)), dtype=np.float32)
+    mag_dir = Path(reference["mag_dir"])
+    chunk_rows = int(reference.get("chunk_rows", REF_MAG_CHUNK_ROWS))
+    for chunk_start, chunk_stop in chunk_ranges(rows, chunk_rows):
+        mask = (row_idx >= chunk_start) & (row_idx < chunk_stop)
+        if not np.any(mask):
+            continue
+        path = mag_chunk_path(mag_dir, chunk_start, chunk_stop)
+        chunk = np.memmap(path, dtype=np.float32, mode="r", shape=(chunk_stop - chunk_start, cols))
+        out[mask, :] = np.asarray(chunk[np.ix_(row_idx[mask] - chunk_start, col_idx)], dtype=np.float32)
+        del chunk
+    return out
+
+
 def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[Path, dict]:
     if not gpu_available():
         raise RuntimeError("chunked full FFT reference requires CuPy")
@@ -342,15 +413,25 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
     matrix = bench.load_binary_coo(matrix_path).tocsr(copy=False)
     rows, cols = matrix.shape
     mag_path = cache_dir / f"{matrix_path.stem}_fullfft_shifted_mag_float32.dat"
+    mag_dir = cache_dir / f"{matrix_path.stem}_fullfft_shifted_mag_float32_chunks"
     meta_path = cache_dir / f"{matrix_path.stem}_fullfft_shifted_meta.json"
     if mag_path.exists() and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if meta.get("rows") == rows and meta.get("cols") == cols and meta.get("shifted") is True:
             meta["status"] = "cache_hit"
             return mag_path, meta
+    if mag_dir.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        chunk_rows = int(meta.get("chunk_rows", REF_MAG_CHUNK_ROWS))
+        chunks_ok = all(mag_chunk_path(mag_dir, start, stop).exists() for start, stop in chunk_ranges(rows, chunk_rows))
+        if meta.get("rows") == rows and meta.get("cols") == cols and meta.get("shifted") is True and meta.get("cache_format") == "row_chunks" and chunks_ok:
+            meta["status"] = "cache_hit"
+            return mag_dir, meta
 
-    row_fft_path = cache_dir / f"{matrix_path.stem}_rowfft_complex64.dat"
-    row_fft = np.memmap(row_fft_path, dtype=np.complex64, mode="w+", shape=(rows, cols))
+    chunk_rows = max(1, REF_MAG_CHUNK_ROWS)
+    row_dir = cache_dir / f"{matrix_path.stem}_rowfft_complex64_chunks"
+    row_dir.mkdir(parents=True, exist_ok=True)
+    mag_dir.mkdir(parents=True, exist_ok=True)
     row_batch = estimate_ref_row_batch(cols)
     row_started = time.perf_counter()
     for start in range(0, rows, row_batch):
@@ -363,36 +444,52 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
                 dense_block[local_row, matrix.indices[left:right]] = 1.0
         dense_gpu = cp.asarray(dense_block, dtype=cp.float32)
         fft_block = cp.fft.fft(dense_gpu, axis=1).astype(cp.complex64, copy=False)
-        row_fft[start:stop, :] = cp.asnumpy(fft_block)
-        row_fft.flush()
+        row_chunk = np.memmap(row_fft_chunk_path(row_dir, start, stop), dtype=np.complex64, mode="w+", shape=(stop - start, cols))
+        row_chunk[:, :] = cp.asnumpy(fft_block)
+        row_chunk.flush()
+        del row_chunk
         del dense_gpu, fft_block, dense_block
         clear_gpu()
         print(f"reference row FFT {matrix_path.stem}: {stop}/{rows}", flush=True)
 
-    mag = np.memmap(mag_path, dtype=np.float32, mode="w+", shape=(rows, cols))
+    for start, stop in chunk_ranges(rows, chunk_rows):
+        mag_chunk = np.memmap(mag_chunk_path(mag_dir, start, stop), dtype=np.float32, mode="w+", shape=(stop - start, cols))
+        mag_chunk.flush()
+        del mag_chunk
+
     row_target = (np.arange(rows, dtype=np.int64) - (rows // 2)) % rows
     col_batch = estimate_ref_col_batch(rows)
     col_started = time.perf_counter()
     for start in range(0, cols, col_batch):
         stop = min(start + col_batch, cols)
-        block = np.array(row_fft[:, start:stop], dtype=np.complex64, copy=True)
+        block = np.empty((rows, stop - start), dtype=np.complex64)
+        for row_start in range(0, rows, row_batch):
+            row_stop = min(row_start + row_batch, rows)
+            row_chunk = np.memmap(row_fft_chunk_path(row_dir, row_start, row_stop), dtype=np.complex64, mode="r", shape=(row_stop - row_start, cols))
+            block[row_start:row_stop, :] = np.asarray(row_chunk[:, start:stop], dtype=np.complex64)
+            del row_chunk
         block_gpu = cp.asarray(block, dtype=cp.complex64)
         fft_block = cp.fft.fft(block_gpu, axis=0).astype(cp.complex64, copy=False)
         abs_block = cp.asnumpy(cp.abs(fft_block).astype(cp.float32))
         col_source = np.arange(start, stop, dtype=np.int64)
         col_target = (col_source - (cols // 2)) % cols
-        mag[np.ix_(row_target, col_target)] = abs_block
-        mag.flush()
+        for chunk_start, chunk_stop in chunk_ranges(rows, chunk_rows):
+            source_rows = (np.arange(chunk_start, chunk_stop, dtype=np.int64) + (rows // 2)) % rows
+            mag_chunk = np.memmap(mag_chunk_path(mag_dir, chunk_start, chunk_stop), dtype=np.float32, mode="r+", shape=(chunk_stop - chunk_start, cols))
+            mag_chunk[:, col_target] = abs_block[source_rows, :]
+            mag_chunk.flush()
+            del mag_chunk
         del block, block_gpu, fft_block, abs_block
         clear_gpu()
         print(f"reference col FFT {matrix_path.stem}: {stop}/{cols}", flush=True)
 
-    del row_fft, mag
-    row_fft_path.unlink(missing_ok=True)
     meta = {
         "rows": rows,
         "cols": cols,
         "shifted": True,
+        "cache_format": "row_chunks",
+        "mag_dir": str(mag_dir),
+        "chunk_rows": chunk_rows,
         "row_batch": row_batch,
         "col_batch": col_batch,
         "row_fft_s": time.perf_counter() - row_started,
@@ -400,7 +497,13 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
         "status": "built",
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return mag_path, meta
+    try:
+        for path in row_dir.glob("*.dat"):
+            path.unlink(missing_ok=True)
+        row_dir.rmdir()
+    except OSError as exc:
+        print(f"warning: could not remove temporary row FFT chunks for {matrix_path.stem}: {exc}", flush=True)
+    return mag_dir, meta
 
 
 def reference_log_spectrum(matrix, matrix_path: Path, cache_dir: Path, force_cache: bool):
@@ -427,10 +530,13 @@ def reference_log_spectrum(matrix, matrix_path: Path, cache_dir: Path, force_cac
         started = time.perf_counter()
         mag_path, meta = build_full_fft_reference_cache(matrix_path, cache_dir)
         timing = dict(meta)
+        if meta.get("cache_format") == "row_chunks":
+            timing.update({"backend": "chunked_gpu_row_chunks", "status": meta.get("status", "ok"), "total_s": time.perf_counter() - started, "mag_dir": str(mag_path), "chunk_rows": meta.get("chunk_rows")})
+            return {"kind": "memmap_chunks", "mag_dir": mag_path, "rows": rows, "cols": cols, "chunk_rows": meta.get("chunk_rows")}, timing
         timing.update({"backend": "chunked_gpu_memmap", "status": meta.get("status", "ok"), "total_s": time.perf_counter() - started, "mag_path": str(mag_path)})
         return {"kind": "memmap", "mag_path": mag_path, "rows": rows, "cols": cols}, timing
     except Exception as exc:
-        return None, {"status": f"reference_error:{type(exc).__name__}", "note": str(exc)}
+        return None, {"status": f"reference_error:{type(exc).__name__}", "note": str(exc), "traceback": traceback.format_exc()}
 
 
 def to_gpu(array):
@@ -561,7 +667,7 @@ def density1024_features(matrix) -> dict:
 
 
 def compute_reference_metrics(reference, resolutions: Iterable[int]) -> dict:
-    if reference["kind"] == "memmap":
+    if reference["kind"] in {"memmap", "memmap_chunks"}:
         return compute_reference_metrics_memmap(reference, resolutions)
     reference = reference["log"]
     out = {
@@ -598,7 +704,6 @@ def entropy_from_sums(total: float, xlogx: float) -> float:
 
 def compute_reference_metrics_memmap(reference: dict, resolutions: Iterable[int]) -> dict:
     rows, cols = reference["rows"], reference["cols"]
-    mag = np.memmap(reference["mag_path"], dtype=np.float32, mode="r", shape=(rows, cols))
     total = 0.0
     xlogx = 0.0
     radial_energy = np.zeros(RADIAL_BINS, dtype=np.float64)
@@ -606,7 +711,7 @@ def compute_reference_metrics_memmap(reference: dict, resolutions: Iterable[int]
         row_stop = min(row_start + METRIC_ROW_BLOCK, rows)
         for col_start in range(0, cols, METRIC_COL_BLOCK):
             col_stop = min(col_start + METRIC_COL_BLOCK, cols)
-            block = np.log1p(np.asarray(mag[row_start:row_stop, col_start:col_stop], dtype=np.float32))
+            block = np.log1p(load_reference_mag_block(reference, row_start, row_stop, col_start, col_stop))
             total += float(block.sum(dtype=np.float64))
             positive = block[block > 0]
             if positive.size:
@@ -618,13 +723,11 @@ def compute_reference_metrics_memmap(reference: dict, resolutions: Iterable[int]
     for res in resolutions:
         small = downsample_reference_memmap(reference, res)
         out["downsample"][str(res)] = {"entropy": entropy_from_log_spectrum(small), "radial": radial_ratio_from_log_spectrum(small).tolist()}
-    del mag
     return out
 
 
 def downsample_reference_memmap(reference: dict, out_size: int) -> np.ndarray:
     rows, cols = reference["rows"], reference["cols"]
-    mag = np.memmap(reference["mag_path"], dtype=np.float32, mode="r", shape=(rows, cols))
     row_pos = np.linspace(0.0, float(rows - 1), out_size, dtype=np.float64) if out_size > 1 else np.zeros(1, dtype=np.float64)
     col_pos = np.linspace(0.0, float(cols - 1), out_size, dtype=np.float64) if out_size > 1 else np.zeros(1, dtype=np.float64)
     r0 = np.floor(row_pos).astype(np.int64)
@@ -633,13 +736,12 @@ def downsample_reference_memmap(reference: dict, out_size: int) -> np.ndarray:
     c1 = np.clip(c0 + 1, 0, cols - 1)
     rw = (row_pos - r0.astype(np.float64))[:, None]
     cw = (col_pos - c0.astype(np.float64))[None, :]
-    c00 = np.log1p(np.asarray(mag[np.ix_(r0, c0)], dtype=np.float32))
-    c01 = np.log1p(np.asarray(mag[np.ix_(r0, c1)], dtype=np.float32))
-    c10 = np.log1p(np.asarray(mag[np.ix_(r1, c0)], dtype=np.float32))
-    c11 = np.log1p(np.asarray(mag[np.ix_(r1, c1)], dtype=np.float32))
+    c00 = np.log1p(load_reference_mag_points(reference, r0, c0))
+    c01 = np.log1p(load_reference_mag_points(reference, r0, c1))
+    c10 = np.log1p(load_reference_mag_points(reference, r1, c0))
+    c11 = np.log1p(load_reference_mag_points(reference, r1, c1))
     top = c00 * (1.0 - cw) + c01 * cw
     bottom = c10 * (1.0 - cw) + c11 * cw
-    del mag
     return (top * (1.0 - rw) + bottom * rw).astype(np.float32, copy=False)
 
 
@@ -675,7 +777,6 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
 
     rows, cols = reference["rows"], reference["cols"]
     small_cpu = cp.asnumpy(small_log) if gpu_available() and cp.get_array_module(small_log) is cp else np.asarray(small_log, dtype=np.float32)
-    mag = np.memmap(reference["mag_path"], dtype=np.float32, mode="r", shape=(rows, cols))
     mae_total = 0.0
     count = 0
     cand_total = 0.0
@@ -686,7 +787,7 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
         for col_start in range(0, cols, METRIC_COL_BLOCK):
             col_stop = min(col_start + METRIC_COL_BLOCK, cols)
             cand = interp_block_numpy(small_cpu, rows, cols, row_start, row_stop, col_start, col_stop)
-            ref = np.log1p(np.asarray(mag[row_start:row_stop, col_start:col_stop], dtype=np.float32))
+            ref = np.log1p(load_reference_mag_block(reference, row_start, row_stop, col_start, col_stop))
             mae_total += float(np.abs(cand - ref).sum(dtype=np.float64))
             count += cand.size
             cand_total += float(cand.sum(dtype=np.float64))
@@ -696,7 +797,6 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
             bins = radial_bins_numpy(rows, cols, row_start, row_stop, col_start, col_stop)
             cand_radial += np.bincount(bins.ravel(), weights=cand.ravel(), minlength=RADIAL_BINS)
     cand_radial = cand_radial / cand_radial.sum() if cand_radial.sum() > 0 else cand_radial
-    del mag
     return {
         "log_mae_interp": float(mae_total / count) if count else math.nan,
         "entropy_error_interp": abs(ref_metrics["full_entropy"] - entropy_from_sums(cand_total, cand_xlogx)),
@@ -704,20 +804,14 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
     }
 
 
-def direct_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
-    res = int(small_log.shape[0])
-    if reference["kind"] == "array":
-        ref_small = downsample_like(reference["log"], res)
-    else:
-        ref_small = downsample_reference_memmap(reference, res)
-    ref_small = to_gpu(ref_small)
-    small_radial = radial_ratio_from_log_spectrum(small_log)
-    ref_small_radial = radial_ratio_from_log_spectrum(ref_small)
+def summary_metric_errors(ref_metrics: dict, log_spec) -> dict:
+    ref_radial = to_gpu(np.asarray(ref_metrics["full_radial"], dtype=np.float64))
+    candidate_radial = radial_ratio_from_log_spectrum(log_spec)
     out = {
-        "entropy_error_direct": abs(entropy_from_log_spectrum(ref_small) - entropy_from_log_spectrum(small_log)),
-        "radial_error_direct": radial_error(ref_small_radial, small_radial),
+        "entropy_error_direct": abs(ref_metrics["full_entropy"] - entropy_from_log_spectrum(log_spec)),
+        "radial_error_direct": radial_error(ref_radial, candidate_radial),
     }
-    del ref_small, small_radial, ref_small_radial
+    del ref_radial, candidate_radial
     return out
 
 
@@ -766,7 +860,7 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
         metric_updates = {}
         if reference is not None:
             metric_updates.update(interpolated_metrics(reference, ref_metrics, small_log))
-            metric_updates.update(direct_metrics(reference, ref_metrics, small_log))
+            metric_updates.update(summary_metric_errors(ref_metrics, small_log))
         interp_s = time.perf_counter() - interp_started
 
         row = {
@@ -947,7 +1041,6 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
         metric_updates = {}
         if reference is not None:
             metric_updates.update(interpolated_metrics(reference, ref_metrics, grid))
-            metric_updates.update(direct_metrics(reference, ref_metrics, grid))
             metric_updates["entropy_error_direct"] = sampled_entropy_error(ref_metrics, features)
             metric_updates["radial_error_direct"] = sampled_radial_error(ref_metrics, features)
         interp_s = time.perf_counter() - interp_started
@@ -1076,6 +1169,7 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
     for curve_index, density_ratio, out_size in density_candidates:
         try:
             norms_to_run = NORMALIZATIONS if args.normalization == "all" else (args.normalization,)
+            print_timing_progress(args, f"[timing] density ratio={density_ratio:g} resolution={out_size} runs={timing_runs(args.timing_warmup, args.timing_repeat)}")
             output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run, args.timing_warmup, args.timing_repeat))
         except Exception as exc:
             output["records"].append({"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"error:{type(exc).__name__}", "note": str(exc)})
@@ -1083,6 +1177,7 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
 
     for method in [item.strip() for item in args.sparse_methods.split(",") if item.strip()]:
         for curve_index, sample_fraction in enumerate(sample_fractions):
+            print_timing_progress(args, f"[timing] sparse method={method} sample_fraction={sample_fraction:g} runs={timing_runs(args.timing_warmup, args.timing_repeat)}")
             output["records"].append(evaluate_sparse_grid(method, matrix, reference, ref_metrics, sample_fraction, args.sparse_batch_size, args.spfft_threads, args.spfft_library, curve_index, args.timing_warmup, args.timing_repeat))
 
     if reference is not None:
