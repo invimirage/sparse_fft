@@ -85,6 +85,69 @@ def parse_float_list(text: str) -> list[float]:
     return [float(item) for item in text.split(",") if item.strip()]
 
 
+def mean_seconds(samples: list[float]) -> float:
+    return float(np.mean(samples)) if samples else math.nan
+
+
+def timed_compression_map(matrix, out_size: int, method: str, warmup: int, repeat: int):
+    for _ in range(warmup):
+        warm_density, _, _ = compression_map(matrix, out_size, method)
+        del warm_density
+        clear_gpu()
+    density = None
+    backend = "unknown"
+    samples: list[float] = []
+    for _ in range(repeat):
+        if density is not None:
+            del density
+            clear_gpu()
+        density, elapsed, backend = compression_map(matrix, out_size, method)
+        samples.append(float(elapsed))
+    if density is None:
+        raise RuntimeError("timing repeat must be at least 1")
+    return density, mean_seconds(samples), backend, samples
+
+
+def timed_density_fft_log_spectrum(density, warmup: int, repeat: int):
+    for _ in range(warmup):
+        warm_log, _ = density_fft_log_spectrum(density)
+        del warm_log
+        clear_gpu()
+    log_spec = None
+    samples: list[float] = []
+    for _ in range(repeat):
+        if log_spec is not None:
+            del log_spec
+            clear_gpu()
+        log_spec, elapsed = density_fft_log_spectrum(density)
+        samples.append(float(elapsed))
+    if log_spec is None:
+        raise RuntimeError("timing repeat must be at least 1")
+    return log_spec, mean_seconds(samples), samples
+
+
+def timed_normalize_density(density, nnz: int, mode: str, warmup: int, repeat: int):
+    for _ in range(warmup):
+        warm_normalized = normalize_density(density, nnz, mode)
+        if warm_normalized is not density:
+            del warm_normalized
+        clear_gpu()
+    normalized = None
+    samples: list[float] = []
+    for _ in range(repeat):
+        if normalized is not None and normalized is not density:
+            del normalized
+            clear_gpu()
+        started = time.perf_counter()
+        normalized = normalize_density(density, nnz, mode)
+        if gpu_available() and xp_of(normalized) is cp:
+            sync()
+        samples.append(float(time.perf_counter() - started))
+    if normalized is None:
+        raise RuntimeError("timing repeat must be at least 1")
+    return normalized, mean_seconds(samples), samples
+
+
 def _load_manifest_rows(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return [row for row in csv.DictReader(handle) if row.get("path") and row.get("status") in {"downloaded", "exists"}]
@@ -685,11 +748,11 @@ def density_work_bytes(out_size: int) -> int:
     return cells * (4 + 8 + 8 + 4 + 4)
 
 
-def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...]) -> list[dict]:
+def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int) -> list[dict]:
     if density_work_bytes(out_size) > DENSITY_MAX_WORK_BYTES:
         return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
     try:
-        density, compress_s, compress_backend = compression_map(matrix, out_size, method)
+        density, compress_s, compress_backend, compress_samples = timed_compression_map(matrix, out_size, method, warmup, repeat)
     except Exception as exc:
         clear_gpu()
         return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"skipped:{type(exc).__name__}", "note": str(exc)}]
@@ -697,9 +760,8 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
     records: list[dict] = []
     normalizations = normalizations if method == "density_fft" else COMPRESSION_BASELINE_NORMALIZATIONS
     for norm in normalizations:
-        started = time.perf_counter()
-        normalized = normalize_density(density, int(matrix.nnz), norm)
-        small_log, fft_s = density_fft_log_spectrum(normalized)
+        normalized, normalize_s, normalize_samples = timed_normalize_density(density, int(matrix.nnz), norm, warmup, repeat)
+        small_log, fft_s, fft_samples = timed_density_fft_log_spectrum(normalized, warmup, repeat)
         interp_started = time.perf_counter()
         metric_updates = {}
         if reference is not None:
@@ -716,9 +778,13 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
             "status": "ok",
             "compress_backend": compress_backend,
             "compress_s": compress_s,
+            "compress_s_samples": compress_samples,
+            "normalize_s": normalize_s,
+            "normalize_s_samples": normalize_samples,
             "fft_s": fft_s,
+            "fft_s_samples": fft_samples,
             "interp_s": interp_s,
-            "total_s": time.perf_counter() - started + compress_s,
+            "total_s": compress_s + normalize_s + fft_s + interp_s,
         }
         row.update(metric_updates)
         records.append(row)
@@ -728,10 +794,10 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
     return records
 
 
-def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...]) -> list[dict]:
+def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int) -> list[dict]:
     records: list[dict] = []
     for method in COMPRESSION_METHODS:
-        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index, normalizations))
+        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index, normalizations, warmup, repeat))
     return records
 
 
@@ -745,6 +811,58 @@ def grid_log_from_coeffs(points, coeffs: np.ndarray) -> np.ndarray:
     for point, value in zip(points, mag, strict=True):
         grid[row_index[point.u_shift], col_index[point.v_shift]] = float(value)
     return grid
+
+
+def build_sparse_grid_sample(rows: int, cols: int, sample_fraction: float):
+    started = time.perf_counter()
+    row_count = max(2, int(math.floor(rows * sample_fraction)))
+    col_count = max(2, int(math.floor(cols * sample_fraction)))
+    row_coords = sparse_sampling.evenly_spaced_shifted_coords(rows, row_count)
+    col_coords = sparse_sampling.evenly_spaced_shifted_coords(cols, col_count)
+    points = []
+    counts = {"total": rows * cols, "core": 0, "axis": 0, "diag": 0, "rest": 0}
+    weight = (rows * cols) / float(len(row_coords) * len(col_coords))
+    for u_shift in row_coords:
+        for v_shift in col_coords:
+            region = bench.classify_sample_region(u_shift, v_shift, rows, cols, 0.12, 3, 3)
+            counts[region] += 1
+            points.append(bench.SamplePoint(u_shift, v_shift, bench.shifted_to_fft_index(u_shift, rows), bench.shifted_to_fft_index(v_shift, cols), 1, region, weight))
+    meta = {"u_bounds": bench.shifted_coord_bounds(rows), "v_bounds": bench.shifted_coord_bounds(cols), "sampled_rows": len(row_coords), "sampled_cols": len(col_coords)}
+    return row_coords, col_coords, points, counts, meta, time.perf_counter() - started
+
+
+def timed_sparse_grid_sample(rows: int, cols: int, sample_fraction: float, warmup: int, repeat: int):
+    for _ in range(warmup):
+        build_sparse_grid_sample(rows, cols, sample_fraction)
+    result = None
+    samples: list[float] = []
+    for _ in range(repeat):
+        result = build_sparse_grid_sample(rows, cols, sample_fraction)
+        samples.append(float(result[-1]))
+    if result is None:
+        raise RuntimeError("timing repeat must be at least 1")
+    row_coords, col_coords, points, counts, meta, _ = result
+    return row_coords, col_coords, points, counts, meta, mean_seconds(samples), samples
+
+
+def timed_sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: int, threads: int, spfft_library: str | None, warmup: int, repeat: int):
+    for _ in range(warmup):
+        warm_features, _ = sparse_grid_features(method, matrix, points, counts, meta, batch_size, threads, spfft_library)
+        del warm_features
+        clear_gpu()
+    features = None
+    backend = "unknown"
+    samples: list[float] = []
+    for _ in range(repeat):
+        if features is not None:
+            del features
+            clear_gpu()
+        features, backend = sparse_grid_features(method, matrix, points, counts, meta, batch_size, threads, spfft_library)
+        samples.append(float(features["elapsed"]))
+    if features is None:
+        raise RuntimeError("timing repeat must be at least 1")
+    features["elapsed"] = mean_seconds(samples)
+    return features, backend, samples
 
 
 def finufft_grid_features(matrix, points, counts: dict, meta: dict, radial_bins: int, prefer_gpu: bool = False):
@@ -810,27 +928,20 @@ def sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: 
     raise ValueError(method)
 
 
-def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, sample_fraction: float, batch_size: int, threads: int, spfft_library: str | None, curve_index: int) -> dict:
+def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, sample_fraction: float, batch_size: int, threads: int, spfft_library: str | None, curve_index: int, warmup: int, repeat: int) -> dict:
     rows, cols = matrix.shape
     original_fraction = os.environ.get("SPARSE_GRID_FRACTION")
     os.environ["SPARSE_GRID_FRACTION"] = str(sample_fraction)
-    started = time.perf_counter()
     row_count = max(2, int(math.floor(rows * sample_fraction)))
     col_count = max(2, int(math.floor(cols * sample_fraction)))
-    row_coords = sparse_sampling.evenly_spaced_shifted_coords(rows, row_count)
-    col_coords = sparse_sampling.evenly_spaced_shifted_coords(cols, col_count)
+    row_coords = []
+    col_coords = []
     points = []
-    counts = {"total": rows * cols, "core": 0, "axis": 0, "diag": 0, "rest": 0}
-    weight = (rows * cols) / float(len(row_coords) * len(col_coords))
-    for u_shift in row_coords:
-        for v_shift in col_coords:
-            region = bench.classify_sample_region(u_shift, v_shift, rows, cols, 0.12, 3, 3)
-            counts[region] += 1
-            points.append(bench.SamplePoint(u_shift, v_shift, bench.shifted_to_fft_index(u_shift, rows), bench.shifted_to_fft_index(v_shift, cols), 1, region, weight))
-    meta = {"u_bounds": bench.shifted_coord_bounds(rows), "v_bounds": bench.shifted_coord_bounds(cols), "sampled_rows": len(row_coords), "sampled_cols": len(col_coords)}
-    sample_s = time.perf_counter() - started
+    sample_s = math.nan
+    sample_samples: list[float] = []
     try:
-        features, backend = sparse_grid_features(method, matrix, points, counts, meta, batch_size, threads, spfft_library)
+        row_coords, col_coords, points, counts, meta, sample_s, sample_samples = timed_sparse_grid_sample(rows, cols, sample_fraction, warmup, repeat)
+        features, backend, compute_samples = timed_sparse_grid_features(method, matrix, points, counts, meta, batch_size, threads, spfft_library, warmup, repeat)
         grid = to_gpu(grid_log_from_coeffs(features["points"], features["coeffs"]))
         interp_started = time.perf_counter()
         metric_updates = {}
@@ -852,7 +963,9 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
             "sample_count": len(points),
             "backend": backend,
             "sample_s": sample_s,
+            "sample_s_samples": sample_samples,
             "compute_s": float(features["elapsed"]),
+            "compute_s_samples": compute_samples,
             "interp_s": interp_s,
             "total_s": sample_s + float(features["elapsed"]) + interp_s,
         }
@@ -896,6 +1009,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid")
     parser.add_argument("--sample-fraction", type=float, default=0.01, help="Legacy single sparse grid axis fraction, used only if --sample-fractions is empty")
     parser.add_argument("--sample-fractions", default="0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01", help="Comma-separated sparse grid axis fractions for error-vs-time curves")
+    parser.add_argument("--timing-warmup", type=int, default=0, help="Warmup runs for non-interpolation timed steps; discarded from reported timings")
+    parser.add_argument("--timing-repeat", type=int, default=1, help="Measured runs for non-interpolation timed steps; reported timings are arithmetic means")
     parser.add_argument("--sparse-batch-size", type=int, default=64)
     parser.add_argument("--spfft-threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", "8")))
     parser.add_argument("--spfft-library", default=os.environ.get("SPFFT_LIBRARY_PATH"))
@@ -906,6 +1021,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> Path:
+    if args.timing_warmup < 0:
+        raise ValueError("--timing-warmup must be non-negative")
+    if args.timing_repeat < 1:
+        raise ValueError("--timing-repeat must be at least 1")
     matrix = bench.load_binary_coo(matrix_path)
     rows, cols = matrix.shape
     if rows != cols:
@@ -936,6 +1055,8 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
         "density_ratios": density_ratios,
         "density_candidates": [{"curve_index": idx, "density_ratio": ratio, "resolution": out_size} for idx, ratio, out_size in density_candidates],
         "sample_fractions": sample_fractions,
+        "timing_warmup": int(args.timing_warmup),
+        "timing_repeat": int(args.timing_repeat),
         "records": [],
     }
 
@@ -955,14 +1076,14 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
     for curve_index, density_ratio, out_size in density_candidates:
         try:
             norms_to_run = NORMALIZATIONS if args.normalization == "all" else (args.normalization,)
-            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run))
+            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run, args.timing_warmup, args.timing_repeat))
         except Exception as exc:
             output["records"].append({"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"error:{type(exc).__name__}", "note": str(exc)})
             clear_gpu()
 
     for method in [item.strip() for item in args.sparse_methods.split(",") if item.strip()]:
         for curve_index, sample_fraction in enumerate(sample_fractions):
-            output["records"].append(evaluate_sparse_grid(method, matrix, reference, ref_metrics, sample_fraction, args.sparse_batch_size, args.spfft_threads, args.spfft_library, curve_index))
+            output["records"].append(evaluate_sparse_grid(method, matrix, reference, ref_metrics, sample_fraction, args.sparse_batch_size, args.spfft_threads, args.spfft_library, curve_index, args.timing_warmup, args.timing_repeat))
 
     if reference is not None:
         del reference
