@@ -356,8 +356,54 @@ def mag_chunk_path(mag_dir: Path, row_start: int, row_stop: int) -> Path:
     return mag_dir / f"rows_{row_start:08d}_{row_stop:08d}.float32.dat"
 
 
+def mag_tile_path(mag_dir: Path, row_start: int, row_stop: int, col_start: int, col_stop: int) -> Path:
+    return mag_dir / f"rows_{row_start:08d}_{row_stop:08d}_cols_{col_start:08d}_{col_stop:08d}.float32.dat"
+
+
 def row_fft_chunk_path(row_dir: Path, row_start: int, row_stop: int) -> Path:
     return row_dir / f"rows_{row_start:08d}_{row_stop:08d}.complex64.dat"
+
+
+def contiguous_runs(values: np.ndarray):
+    if values.size == 0:
+        return
+    start = 0
+    for idx in range(1, int(values.size)):
+        if int(values[idx]) != int(values[idx - 1]) + 1:
+            yield start, idx
+            start = idx
+    yield start, int(values.size)
+
+
+def shifted_col_tile_ranges(cols: int, col_batch: int):
+    for start, stop in chunk_ranges(cols, col_batch):
+        col_source = np.arange(start, stop, dtype=np.int64)
+        col_target = (col_source - (cols // 2)) % cols
+        order = np.argsort(col_target)
+        sorted_target = col_target[order]
+        for run_start, run_stop in contiguous_runs(sorted_target):
+            yield int(sorted_target[run_start]), int(sorted_target[run_stop - 1]) + 1
+
+
+def read_float32_tile_block(path: Path, tile_rows: int, tile_cols: int, row_start: int, row_stop: int, col_start: int, col_stop: int) -> np.ndarray:
+    out = np.empty((row_stop - row_start, col_stop - col_start), dtype=np.float32)
+    itemsize = np.dtype(np.float32).itemsize
+    row_bytes = tile_cols * itemsize
+    read_cols = col_stop - col_start
+    with path.open("rb") as handle:
+        for out_row, tile_row in enumerate(range(row_start, row_stop)):
+            handle.seek(tile_row * row_bytes + col_start * itemsize)
+            data = handle.read(read_cols * itemsize)
+            out[out_row, :] = np.frombuffer(data, dtype=np.float32, count=read_cols)
+    return out
+
+
+def overlapping_ranges(start: int, stop: int, chunk_size: int, limit: int):
+    first = (start // chunk_size) * chunk_size
+    for chunk_start in range(first, stop, chunk_size):
+        chunk_stop = min(chunk_start + chunk_size, limit)
+        if chunk_stop > start and chunk_start < stop:
+            yield chunk_start, chunk_stop
 
 
 def load_reference_mag_block(reference: dict, row_start: int, row_stop: int, col_start: int, col_stop: int) -> np.ndarray:
@@ -370,6 +416,32 @@ def load_reference_mag_block(reference: dict, row_start: int, row_stop: int, col
 
     mag_dir = Path(reference["mag_dir"])
     chunk_rows = int(reference.get("chunk_rows", REF_MAG_CHUNK_ROWS))
+    if reference.get("cache_format") == "row_col_tiles":
+        col_batch = int(reference.get("col_batch", REF_COL_BATCH_CAP))
+        out = np.empty((row_stop - row_start, col_stop - col_start), dtype=np.float32)
+        for chunk_start, chunk_stop in overlapping_ranges(row_start, row_stop, chunk_rows, rows):
+            out_r0 = max(row_start, chunk_start) - row_start
+            out_r1 = min(row_stop, chunk_stop) - row_start
+            tile_r0 = max(row_start, chunk_start) - chunk_start
+            tile_r1 = min(row_stop, chunk_stop) - chunk_start
+            for tile_col_start, tile_col_stop in shifted_col_tile_ranges(cols, col_batch):
+                if tile_col_stop <= col_start or tile_col_start >= col_stop:
+                    continue
+                out_c0 = max(col_start, tile_col_start) - col_start
+                out_c1 = min(col_stop, tile_col_stop) - col_start
+                tile_c0 = max(col_start, tile_col_start) - tile_col_start
+                tile_c1 = min(col_stop, tile_col_stop) - tile_col_start
+                out[out_r0:out_r1, out_c0:out_c1] = read_float32_tile_block(
+                    mag_tile_path(mag_dir, chunk_start, chunk_stop, tile_col_start, tile_col_stop),
+                    chunk_stop - chunk_start,
+                    tile_col_stop - tile_col_start,
+                    tile_r0,
+                    tile_r1,
+                    tile_c0,
+                    tile_c1,
+                )
+        return out
+
     pieces = []
     current = row_start
     while current < row_stop:
@@ -395,6 +467,13 @@ def load_reference_mag_points(reference: dict, row_idx: np.ndarray, col_idx: np.
     out = np.empty((len(row_idx), len(col_idx)), dtype=np.float32)
     mag_dir = Path(reference["mag_dir"])
     chunk_rows = int(reference.get("chunk_rows", REF_MAG_CHUNK_ROWS))
+    if reference.get("cache_format") == "row_col_tiles":
+        out = np.empty((len(row_idx), len(col_idx)), dtype=np.float32)
+        for out_r, row in enumerate(row_idx.tolist()):
+            for out_c, col in enumerate(col_idx.tolist()):
+                out[out_r, out_c] = load_reference_mag_block(reference, row, row + 1, col, col + 1)[0, 0]
+        return out
+
     for chunk_start, chunk_stop in chunk_ranges(rows, chunk_rows):
         mask = (row_idx >= chunk_start) & (row_idx < chunk_stop)
         if not np.any(mask):
@@ -423,8 +502,16 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
     if mag_dir.exists() and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         chunk_rows = int(meta.get("chunk_rows", REF_MAG_CHUNK_ROWS))
-        chunks_ok = all(mag_chunk_path(mag_dir, start, stop).exists() for start, stop in chunk_ranges(rows, chunk_rows))
-        if meta.get("rows") == rows and meta.get("cols") == cols and meta.get("shifted") is True and meta.get("cache_format") == "row_chunks" and chunks_ok:
+        if meta.get("cache_format") == "row_col_tiles":
+            col_batch = int(meta.get("col_batch", REF_COL_BATCH_CAP))
+            chunks_ok = all(
+                mag_tile_path(mag_dir, row_start, row_stop, col_start, col_stop).exists()
+                for row_start, row_stop in chunk_ranges(rows, chunk_rows)
+                for col_start, col_stop in shifted_col_tile_ranges(cols, col_batch)
+            )
+        else:
+            chunks_ok = all(mag_chunk_path(mag_dir, start, stop).exists() for start, stop in chunk_ranges(rows, chunk_rows))
+        if meta.get("rows") == rows and meta.get("cols") == cols and meta.get("shifted") is True and chunks_ok:
             meta["status"] = "cache_hit"
             return mag_dir, meta
 
@@ -437,27 +524,27 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
     for start in range(0, rows, row_batch):
         stop = min(start + row_batch, rows)
         print(f"reference row FFT {matrix_path.stem}: starting rows {start}:{stop}/{rows}", flush=True)
-        dense_block = np.zeros((stop - start, cols), dtype=np.float32)
+        row_nnz = int(matrix.indptr[stop] - matrix.indptr[start])
+        print(f"reference row FFT {matrix_path.stem}: building GPU dense rows {start}:{stop}/{rows} nnz={row_nnz}", flush=True)
+        dense_gpu = cp.zeros((stop - start, cols), dtype=cp.float32)
         for local_row, global_row in enumerate(range(start, stop)):
             left = matrix.indptr[global_row]
             right = matrix.indptr[global_row + 1]
             if right > left:
-                dense_block[local_row, matrix.indices[left:right]] = 1.0
-        dense_gpu = cp.asarray(dense_block, dtype=cp.float32)
+                dense_gpu[local_row, cp.asarray(matrix.indices[left:right])] = 1.0
+        sync()
+        print(f"reference row FFT {matrix_path.stem}: filled dense rows {start}:{stop}/{rows}", flush=True)
         fft_block = cp.fft.fft(dense_gpu, axis=1).astype(cp.complex64, copy=False)
-        row_chunk = np.memmap(row_fft_chunk_path(row_dir, start, stop), dtype=np.complex64, mode="w+", shape=(stop - start, cols))
-        row_chunk[:, :] = cp.asnumpy(fft_block)
-        row_chunk.flush()
+        sync()
+        print(f"reference row FFT {matrix_path.stem}: computed GPU FFT rows {start}:{stop}/{rows}", flush=True)
+        row_chunk = cp.asnumpy(fft_block)
+        print(f"reference row FFT {matrix_path.stem}: copied FFT rows {start}:{stop}/{rows} to CPU", flush=True)
+        with row_fft_chunk_path(row_dir, start, stop).open("wb") as handle:
+            handle.write(np.ascontiguousarray(row_chunk).tobytes())
         del row_chunk
-        del dense_gpu, fft_block, dense_block
+        del dense_gpu, fft_block
         clear_gpu()
         print(f"reference row FFT {matrix_path.stem}: finished rows {stop}/{rows}", flush=True)
-
-    for start, stop in chunk_ranges(rows, chunk_rows):
-        print(f"reference mag chunks {matrix_path.stem}: allocating rows {start}:{stop}/{rows}", flush=True)
-        mag_chunk = np.memmap(mag_chunk_path(mag_dir, start, stop), dtype=np.float32, mode="w+", shape=(stop - start, cols))
-        mag_chunk.flush()
-        del mag_chunk
 
     row_target = (np.arange(rows, dtype=np.int64) - (rows // 2)) % rows
     col_batch = estimate_ref_col_batch(rows)
@@ -468,7 +555,7 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
         block = np.empty((rows, stop - start), dtype=np.complex64)
         for row_start in range(0, rows, row_batch):
             row_stop = min(row_start + row_batch, rows)
-            row_chunk = np.memmap(row_fft_chunk_path(row_dir, row_start, row_stop), dtype=np.complex64, mode="r", shape=(row_stop - row_start, cols))
+            row_chunk = np.fromfile(row_fft_chunk_path(row_dir, row_start, row_stop), dtype=np.complex64).reshape(row_stop - row_start, cols)
             block[row_start:row_stop, :] = np.asarray(row_chunk[:, start:stop], dtype=np.complex64)
             del row_chunk
         block_gpu = cp.asarray(block, dtype=cp.complex64)
@@ -476,12 +563,16 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
         abs_block = cp.asnumpy(cp.abs(fft_block).astype(cp.float32))
         col_source = np.arange(start, stop, dtype=np.int64)
         col_target = (col_source - (cols // 2)) % cols
+        order = np.argsort(col_target)
+        sorted_target = col_target[order]
         for chunk_start, chunk_stop in chunk_ranges(rows, chunk_rows):
             source_rows = (np.arange(chunk_start, chunk_stop, dtype=np.int64) + (rows // 2)) % rows
-            mag_chunk = np.memmap(mag_chunk_path(mag_dir, chunk_start, chunk_stop), dtype=np.float32, mode="r+", shape=(chunk_stop - chunk_start, cols))
-            mag_chunk[:, col_target] = abs_block[source_rows, :]
-            mag_chunk.flush()
-            del mag_chunk
+            for run_start, run_stop in contiguous_runs(sorted_target):
+                target_start = int(sorted_target[run_start])
+                target_stop = int(sorted_target[run_stop - 1]) + 1
+                data = np.ascontiguousarray(abs_block[source_rows[:, None], order[run_start:run_stop][None, :]])
+                with mag_tile_path(mag_dir, chunk_start, chunk_stop, target_start, target_stop).open("wb") as handle:
+                    handle.write(data.tobytes())
         del block, block_gpu, fft_block, abs_block
         clear_gpu()
         print(f"reference col FFT {matrix_path.stem}: finished cols {stop}/{cols}", flush=True)
@@ -490,7 +581,7 @@ def build_full_fft_reference_cache(matrix_path: Path, cache_dir: Path) -> tuple[
         "rows": rows,
         "cols": cols,
         "shifted": True,
-        "cache_format": "row_chunks",
+        "cache_format": "row_col_tiles",
         "mag_dir": str(mag_dir),
         "chunk_rows": chunk_rows,
         "row_batch": row_batch,
@@ -533,9 +624,9 @@ def reference_log_spectrum(matrix, matrix_path: Path, cache_dir: Path, force_cac
         started = time.perf_counter()
         mag_path, meta = build_full_fft_reference_cache(matrix_path, cache_dir)
         timing = dict(meta)
-        if meta.get("cache_format") == "row_chunks":
-            timing.update({"backend": "chunked_gpu_row_chunks", "status": meta.get("status", "ok"), "total_s": time.perf_counter() - started, "mag_dir": str(mag_path), "chunk_rows": meta.get("chunk_rows")})
-            return {"kind": "memmap_chunks", "mag_dir": mag_path, "rows": rows, "cols": cols, "chunk_rows": meta.get("chunk_rows")}, timing
+        if meta.get("cache_format") in {"row_chunks", "row_col_tiles"}:
+            timing.update({"backend": "chunked_gpu_row_chunks", "status": meta.get("status", "ok"), "total_s": time.perf_counter() - started, "mag_dir": str(mag_path), "chunk_rows": meta.get("chunk_rows"), "col_batch": meta.get("col_batch"), "cache_format": meta.get("cache_format")})
+            return {"kind": "memmap_chunks", "mag_dir": mag_path, "rows": rows, "cols": cols, "chunk_rows": meta.get("chunk_rows"), "col_batch": meta.get("col_batch"), "cache_format": meta.get("cache_format")}, timing
         timing.update({"backend": "chunked_gpu_memmap", "status": meta.get("status", "ok"), "total_s": time.perf_counter() - started, "mag_path": str(mag_path)})
         return {"kind": "memmap", "mag_path": mag_path, "rows": rows, "cols": cols}, timing
     except Exception as exc:
