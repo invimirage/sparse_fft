@@ -685,7 +685,7 @@ def density_work_bytes(out_size: int) -> int:
     return cells * (4 + 8 + 8 + 4 + 4)
 
 
-def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
+def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...]) -> list[dict]:
     if density_work_bytes(out_size) > DENSITY_MAX_WORK_BYTES:
         return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
     try:
@@ -695,7 +695,7 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
         return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"skipped:{type(exc).__name__}", "note": str(exc)}]
     density = to_gpu(density)
     records: list[dict] = []
-    normalizations = NORMALIZATIONS if method == "density_fft" else COMPRESSION_BASELINE_NORMALIZATIONS
+    normalizations = normalizations if method == "density_fft" else COMPRESSION_BASELINE_NORMALIZATIONS
     for norm in normalizations:
         started = time.perf_counter()
         normalized = normalize_density(density, int(matrix.nnz), norm)
@@ -728,10 +728,10 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
     return records
 
 
-def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int) -> list[dict]:
+def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...]) -> list[dict]:
     records: list[dict] = []
     for method in COMPRESSION_METHODS:
-        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index))
+        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index, normalizations))
     return records
 
 
@@ -892,7 +892,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("results/raw"))
     parser.add_argument("--resolutions", default="", help="Legacy fixed density sizes. If set, these are run in addition to --density-ratios")
     parser.add_argument("--density-ratios", default=DENSITY_RATIOS_DEFAULT, help="Comma-separated density map ratios scanned from large to small; default max is 0.5")
-    parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid,finufft_grid,cufinufft_grid,fps_sft,kapralov_sfft")
+    parser.add_argument("--normalization", choices=("all", *NORMALIZATIONS), default="all", help="Density FFT normalization to run; default runs all normalizations")
+    parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid")
     parser.add_argument("--sample-fraction", type=float, default=0.01, help="Legacy single sparse grid axis fraction, used only if --sample-fractions is empty")
     parser.add_argument("--sample-fractions", default="0.00015625,0.0003125,0.000625,0.00125,0.0025,0.005,0.01", help="Comma-separated sparse grid axis fractions for error-vs-time curves")
     parser.add_argument("--sparse-batch-size", type=int, default=64)
@@ -924,6 +925,7 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
         if res not in seen_sizes:
             density_candidates.append((len(density_candidates), float(res) / float(min(rows, cols)), res))
     sample_fractions = parse_float_list(args.sample_fractions) if args.sample_fractions.strip() else [args.sample_fraction]
+    sample_fractions.sort(reverse=True)  # 从大到小跑，如果大的 OOM 报错，后面小的还可以继续尝试
     output = {
         "matrix": matrix_path.stem,
         "path": str(matrix_path),
@@ -952,7 +954,8 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
 
     for curve_index, density_ratio, out_size in density_candidates:
         try:
-            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index))
+            norms_to_run = NORMALIZATIONS if args.normalization == "all" else (args.normalization,)
+            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run))
         except Exception as exc:
             output["records"].append({"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"error:{type(exc).__name__}", "note": str(exc)})
             clear_gpu()
