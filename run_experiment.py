@@ -18,6 +18,7 @@ import csv
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -60,6 +61,9 @@ REF_GPU_WORK_BYTES = int(float(os.environ.get("REF_GPU_WORK_BYTES", str(8 * 1024
 REF_MAG_CHUNK_ROWS = int(os.environ.get("REF_MAG_CHUNK_ROWS", "10000"))
 METRIC_ROW_BLOCK = int(os.environ.get("METRIC_ROW_BLOCK", "512"))
 METRIC_COL_BLOCK = int(os.environ.get("METRIC_COL_BLOCK", "2048"))
+FPS_SFT_NNZ_SAMPLES = int(os.environ.get("FPS_SFT_NNZ_SAMPLES", "65536"))
+KAPRALOV_SFFT_NNZ_SAMPLES = int(os.environ.get("KAPRALOV_SFFT_NNZ_SAMPLES", "65536"))
+PROXY_SFT_SEED = int(os.environ.get("PROXY_SFT_SEED", "17"))
 
 
 def gpu_available() -> bool:
@@ -801,8 +805,11 @@ def compute_reference_metrics_memmap(reference: dict, resolutions: Iterable[int]
     total = 0.0
     xlogx = 0.0
     radial_energy = np.zeros(RADIAL_BINS, dtype=np.float64)
+    print(f"reference metrics: scanning full reference {rows}x{cols}", flush=True)
     for row_start in range(0, rows, METRIC_ROW_BLOCK):
         row_stop = min(row_start + METRIC_ROW_BLOCK, rows)
+        if row_start == 0 or row_start % max(METRIC_ROW_BLOCK, 8192) == 0:
+            print(f"reference metrics: rows {row_start}:{row_stop}/{rows}", flush=True)
         for col_start in range(0, cols, METRIC_COL_BLOCK):
             col_stop = min(col_start + METRIC_COL_BLOCK, cols)
             block = np.log1p(load_reference_mag_block(reference, row_start, row_stop, col_start, col_stop))
@@ -812,6 +819,7 @@ def compute_reference_metrics_memmap(reference: dict, resolutions: Iterable[int]
                 xlogx += float((positive.astype(np.float64) * np.log(positive.astype(np.float64))).sum(dtype=np.float64))
             bins = radial_bins_numpy(rows, cols, row_start, row_stop, col_start, col_stop)
             radial_energy += np.bincount(bins.ravel(), weights=block.ravel(), minlength=RADIAL_BINS)
+    print(f"reference metrics: finished full reference {rows}x{cols}", flush=True)
     full_radial = radial_energy / radial_energy.sum() if radial_energy.sum() > 0 else radial_energy
     out = {"full_entropy": entropy_from_sums(total, xlogx), "full_radial": full_radial.tolist(), "downsample": {}}
     for res in resolutions:
@@ -854,7 +862,7 @@ def interp_block_numpy(sample: np.ndarray, rows: int, cols: int, row_start: int,
     return (top * (1.0 - rw) + bottom * rw).astype(np.float32, copy=False)
 
 
-def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
+def interpolated_metrics(reference: dict, ref_metrics: dict, small_log, label: str = "candidate") -> dict:
     if reference["kind"] == "array":
         ref_log = reference["log"]
         rows, cols = ref_log.shape
@@ -876,8 +884,11 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
     cand_total = 0.0
     cand_xlogx = 0.0
     cand_radial = np.zeros(RADIAL_BINS, dtype=np.float64)
+    print(f"interpolated metrics {label}: scanning full reference {rows}x{cols}", flush=True)
     for row_start in range(0, rows, METRIC_ROW_BLOCK):
         row_stop = min(row_start + METRIC_ROW_BLOCK, rows)
+        if row_start == 0 or row_start % max(METRIC_ROW_BLOCK, 8192) == 0:
+            print(f"interpolated metrics {label}: rows {row_start}:{row_stop}/{rows}", flush=True)
         for col_start in range(0, cols, METRIC_COL_BLOCK):
             col_stop = min(col_start + METRIC_COL_BLOCK, cols)
             cand = interp_block_numpy(small_cpu, rows, cols, row_start, row_stop, col_start, col_stop)
@@ -891,11 +902,57 @@ def interpolated_metrics(reference: dict, ref_metrics: dict, small_log) -> dict:
             bins = radial_bins_numpy(rows, cols, row_start, row_stop, col_start, col_stop)
             cand_radial += np.bincount(bins.ravel(), weights=cand.ravel(), minlength=RADIAL_BINS)
     cand_radial = cand_radial / cand_radial.sum() if cand_radial.sum() > 0 else cand_radial
+    print(f"interpolated metrics {label}: finished full reference {rows}x{cols}", flush=True)
     return {
         "log_mae_interp": float(mae_total / count) if count else math.nan,
         "entropy_error_interp": abs(ref_metrics["full_entropy"] - entropy_from_sums(cand_total, cand_xlogx)),
         "radial_error_interp": float(np.mean(np.abs(np.asarray(ref_metrics["full_radial"], dtype=np.float64) - cand_radial))),
     }
+
+
+def apply_interpolated_metrics_batch(reference: dict, ref_metrics: dict, pending: list[tuple[dict, np.ndarray, str]], label_prefix: str = "batched interpolated metrics") -> None:
+    if not pending:
+        return
+    if reference["kind"] == "array":
+        for row, grid_cpu, label in pending:
+            started = time.perf_counter()
+            ref_log = reference["log"]
+            rows, cols = ref_log.shape
+            full_log = interp2(to_gpu(grid_cpu), rows, cols)
+            row["log_mae_interp"] = log_mae(ref_log, full_log)
+            row["interp_s"] = time.perf_counter() - started
+            row["total_s"] = row.get("sample_s", 0.0) + row.get("compute_s", 0.0) + row["interp_s"]
+            del full_log
+        return
+
+    rows, cols = reference["rows"], reference["cols"]
+    n = len(pending)
+    mae_total = np.zeros(n, dtype=np.float64)
+    counts = np.zeros(n, dtype=np.int64)
+    started = time.perf_counter()
+    labels = ", ".join(label for _, _, label in pending[:4])
+    more = "..." if n > 4 else ""
+    print(f"{label_prefix}: {n} candidates ({labels}{more}) scanning {rows}x{cols}", flush=True)
+    for row_start in range(0, rows, METRIC_ROW_BLOCK):
+        row_stop = min(row_start + METRIC_ROW_BLOCK, rows)
+        if row_start == 0 or row_start % max(METRIC_ROW_BLOCK, 8192) == 0:
+            print(f"{label_prefix}: rows {row_start}:{row_stop}/{rows}", flush=True)
+        for col_start in range(0, cols, METRIC_COL_BLOCK):
+            col_stop = min(col_start + METRIC_COL_BLOCK, cols)
+            ref = np.log1p(load_reference_mag_block(reference, row_start, row_stop, col_start, col_stop))
+            for idx, (_, grid_cpu, _) in enumerate(pending):
+                cand = interp_block_numpy(grid_cpu, rows, cols, row_start, row_stop, col_start, col_stop)
+                mae_total[idx] += float(np.abs(cand - ref).sum(dtype=np.float64))
+                counts[idx] += cand.size
+    elapsed = time.perf_counter() - started
+    per_candidate_s = elapsed / max(1, n)
+    for idx, (row, _, _) in enumerate(pending):
+        row.update({
+            "log_mae_interp": float(mae_total[idx] / counts[idx]) if counts[idx] else math.nan,
+            "interp_s": per_candidate_s,
+        })
+        row["total_s"] = row.get("sample_s", 0.0) + row.get("compute_s", 0.0) + row["interp_s"]
+    print(f"{label_prefix}: finished {n} candidates in {elapsed:.3f}s", flush=True)
 
 
 def summary_metric_errors(ref_metrics: dict, log_spec) -> dict:
@@ -936,7 +993,7 @@ def density_work_bytes(out_size: int) -> int:
     return cells * (4 + 8 + 8 + 4 + 4)
 
 
-def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int) -> list[dict]:
+def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int, defer_interp: bool = False) -> list:
     if density_work_bytes(out_size) > DENSITY_MAX_WORK_BYTES:
         return [{"method": method, "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": "skipped:workset_limit", "estimated_work_bytes": density_work_bytes(out_size)}]
     try:
@@ -953,7 +1010,8 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
         interp_started = time.perf_counter()
         metric_updates = {}
         if reference is not None:
-            metric_updates.update(interpolated_metrics(reference, ref_metrics, small_log))
+            if not defer_interp:
+                metric_updates.update(interpolated_metrics(reference, ref_metrics, small_log, label=f"{method}:{norm}:ratio={density_ratio:g}"))
             metric_updates.update(summary_metric_errors(ref_metrics, small_log))
         interp_s = time.perf_counter() - interp_started
 
@@ -975,17 +1033,21 @@ def evaluate_compression(method: str, matrix, reference, ref_metrics: dict, out_
             "total_s": compress_s + normalize_s + fft_s + interp_s,
         }
         row.update(metric_updates)
-        records.append(row)
+        if defer_interp and reference is not None:
+            small_cpu = cp.asnumpy(small_log) if gpu_available() and cp.get_array_module(small_log) is cp else np.asarray(small_log, dtype=np.float32).copy()
+            records.append((row, small_cpu, f"{method}:{norm}:ratio={density_ratio:g}"))
+        else:
+            records.append(row)
         del normalized, small_log
         clear_gpu()
     del density
     return records
 
 
-def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int) -> list[dict]:
-    records: list[dict] = []
-    for method in COMPRESSION_METHODS:
-        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index, normalizations, warmup, repeat))
+def evaluate_density(matrix, reference, ref_metrics: dict, out_size: int, density_ratio: float, curve_index: int, normalizations: tuple[str, ...], warmup: int, repeat: int, compression_methods: tuple[str, ...] = COMPRESSION_METHODS, defer_interp: bool = False) -> list:
+    records: list = []
+    for method in compression_methods:
+        records.extend(evaluate_compression(method, matrix, reference, ref_metrics, out_size, density_ratio, curve_index, normalizations, warmup, repeat, defer_interp=defer_interp))
     return records
 
 
@@ -1096,6 +1158,102 @@ def finufft_grid_features(matrix, points, counts: dict, meta: dict, radial_bins:
     return result
 
 
+def _coeffs_from_sampled_nnz(rows_idx: np.ndarray, cols_idx: np.ndarray, weights: np.ndarray, rows: int, cols: int, points, batch_size: int) -> np.ndarray:
+    if rows_idx.size == 0:
+        return np.zeros(len(points), dtype=np.complex64)
+    if gpu_available():
+        r_gpu = cp.asarray(rows_idx.astype(np.float32, copy=False))
+        c_gpu = cp.asarray(cols_idx.astype(np.float32, copy=False))
+        w_gpu = cp.asarray(weights.astype(np.float32, copy=False))
+        freq_u = cp.asarray(np.array([point.u_freq for point in points], dtype=np.float32))
+        freq_v = cp.asarray(np.array([point.v_freq for point in points], dtype=np.float32))
+        coeffs = np.empty(len(points), dtype=np.complex64)
+        for start in range(0, len(points), batch_size):
+            stop = min(start + batch_size, len(points))
+            phase = (freq_u[start:stop, None] * r_gpu[None, :] / float(rows)) + (freq_v[start:stop, None] * c_gpu[None, :] / float(cols))
+            coeff_batch = (cp.exp((-1j * bench.TWO_PI) * phase).astype(cp.complex64) * w_gpu[None, :]).sum(axis=1)
+            coeffs[start:stop] = cp.asnumpy(coeff_batch)
+            del phase, coeff_batch
+            clear_gpu()
+        return coeffs
+
+    coeffs = np.empty(len(points), dtype=np.complex64)
+    r = rows_idx.astype(np.float32, copy=False)
+    c = cols_idx.astype(np.float32, copy=False)
+    w = weights.astype(np.float32, copy=False)
+    for start in range(0, len(points), batch_size):
+        stop = min(start + batch_size, len(points))
+        u = np.array([point.u_freq for point in points[start:stop]], dtype=np.float32)
+        v = np.array([point.v_freq for point in points[start:stop]], dtype=np.float32)
+        phase = (u[:, None] * r[None, :] / float(rows)) + (v[:, None] * c[None, :] / float(cols))
+        coeffs[start:stop] = (np.exp((-1j * bench.TWO_PI) * phase).astype(np.complex64) * w[None, :]).sum(axis=1)
+    return coeffs
+
+
+def _sample_nnz_uniform(coo, sample_limit: int, seed: int):
+    nnz = int(coo.nnz)
+    if nnz <= sample_limit:
+        idx = np.arange(nnz, dtype=np.int64)
+        scale = 1.0
+    else:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(nnz, size=sample_limit, replace=False)
+        scale = float(nnz) / float(sample_limit)
+    return coo.row[idx], coo.col[idx], np.full(idx.size, scale, dtype=np.float32)
+
+
+def _sample_nnz_stratified_rows(coo, sample_limit: int, rows: int, seed: int):
+    nnz = int(coo.nnz)
+    if nnz <= sample_limit:
+        idx = np.arange(nnz, dtype=np.int64)
+        return coo.row[idx], coo.col[idx], np.ones(idx.size, dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    order = np.argsort(coo.row, kind="stable")
+    sorted_rows = coo.row[order]
+    unique_rows, starts, row_counts = np.unique(sorted_rows, return_index=True, return_counts=True)
+    active_rows = unique_rows.size
+    per_row = max(1, sample_limit // max(1, active_rows))
+    selected = []
+    weights = []
+    remaining = sample_limit
+    for start, count in zip(starts.tolist(), row_counts.tolist(), strict=True):
+        if remaining <= 0:
+            break
+        take = min(count, per_row, remaining)
+        row_indices = order[start:start + count]
+        chosen = row_indices if take == count else rng.choice(row_indices, size=take, replace=False)
+        selected.append(chosen)
+        weights.append(np.full(take, float(count) / float(take), dtype=np.float32))
+        remaining -= take
+    idx = np.concatenate(selected) if selected else np.empty(0, dtype=np.int64)
+    weight = np.concatenate(weights) if weights else np.empty(0, dtype=np.float32)
+    return coo.row[idx], coo.col[idx], weight
+
+
+def proxy_sft_grid_features(method: str, matrix, points, counts: dict, meta: dict, radial_bins: int, batch_size: int):
+    coo = matrix.tocoo(copy=False)
+    rows, cols = coo.shape
+    started = time.perf_counter()
+    seed = PROXY_SFT_SEED + rows * 1009 + cols * 9176 + len(points)
+    if method == "fps_sft":
+        sample_limit = max(1, FPS_SFT_NNZ_SAMPLES)
+        sample_rows, sample_cols, weights = _sample_nnz_uniform(coo, sample_limit, seed)
+        backend = "python_cuda_uniform_nnz_proxy" if gpu_available() else "python_uniform_nnz_proxy"
+    elif method == "kapralov_sfft":
+        sample_limit = max(1, KAPRALOV_SFFT_NNZ_SAMPLES)
+        sample_rows, sample_cols, weights = _sample_nnz_stratified_rows(coo, sample_limit, rows, seed)
+        backend = "python_cuda_stratified_nnz_proxy" if gpu_available() else "python_stratified_nnz_proxy"
+    else:
+        raise ValueError(method)
+    coeffs = _coeffs_from_sampled_nnz(sample_rows, sample_cols, weights, rows, cols, points, batch_size)
+    elapsed = time.perf_counter() - started
+    result = sparse_sampling.sampled_features_from_coeffs(points, counts, meta, coeffs, radial_bins, elapsed)
+    result["backend"] = backend
+    result["sampled_nnz"] = int(sample_rows.size)
+    result["sampled_nnz_limit"] = int(sample_limit)
+    return result
+
+
 def sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: int, threads: int, spfft_library: str | None):
     if method == "spfft_grid":
         try:
@@ -1112,11 +1270,12 @@ def sparse_grid_features(method: str, matrix, points, counts, meta, batch_size: 
         features = finufft_grid_features(matrix, points, counts, meta, RADIAL_BINS, prefer_gpu=True)
         return features, features.get("backend", "finufft_cpu")
     if method in {"fps_sft", "kapralov_sfft"}:
-        raise ImportError(f"{method} external adapter is not configured in this environment")
+        features = proxy_sft_grid_features(method, matrix, points, counts, meta, RADIAL_BINS, batch_size)
+        return features, features.get("backend", "python_proxy")
     raise ValueError(method)
 
 
-def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, sample_fraction: float, batch_size: int, threads: int, spfft_library: str | None, curve_index: int, warmup: int, repeat: int) -> dict:
+def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, sample_fraction: float, batch_size: int, threads: int, spfft_library: str | None, curve_index: int, warmup: int, repeat: int, defer_interp: bool = False):
     rows, cols = matrix.shape
     original_fraction = os.environ.get("SPARSE_GRID_FRACTION")
     os.environ["SPARSE_GRID_FRACTION"] = str(sample_fraction)
@@ -1130,18 +1289,21 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
     try:
         row_coords, col_coords, points, counts, meta, sample_s, sample_samples = timed_sparse_grid_sample(rows, cols, sample_fraction, warmup, repeat)
         features, backend, compute_samples = timed_sparse_grid_features(method, matrix, points, counts, meta, batch_size, threads, spfft_library, warmup, repeat)
-        grid = to_gpu(grid_log_from_coeffs(features["points"], features["coeffs"]))
+        grid_cpu = grid_log_from_coeffs(features["points"], features["coeffs"])
         interp_started = time.perf_counter()
         metric_updates = {}
         if reference is not None:
-            metric_updates.update(interpolated_metrics(reference, ref_metrics, grid))
+            if not defer_interp:
+                grid = to_gpu(grid_cpu)
+                metric_updates.update(interpolated_metrics(reference, ref_metrics, grid, label=f"{method}:sample_fraction={sample_fraction:g}"))
+                del grid
             metric_updates["entropy_error_direct"] = sampled_entropy_error(ref_metrics, features)
             metric_updates["radial_error_direct"] = sampled_radial_error(ref_metrics, features)
         interp_s = time.perf_counter() - interp_started
         row = {
             "method": method,
             "normalization": "na",
-            "resolution": int(grid.shape[0]),
+            "resolution": int(grid_cpu.shape[0]),
             "status": "ok",
             "curve_index": curve_index,
             "sample_fraction": sample_fraction,
@@ -1157,7 +1319,9 @@ def evaluate_sparse_grid(method: str, matrix, reference, ref_metrics: dict, samp
             "total_s": sample_s + float(features["elapsed"]) + interp_s,
         }
         row.update(metric_updates)
-        del grid
+        if defer_interp and reference is not None:
+            return row, grid_cpu
+        del grid_cpu
         return row
     except ImportError as exc:
         clear_gpu()
@@ -1192,6 +1356,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("results/raw"))
     parser.add_argument("--resolutions", default="", help="Legacy fixed density sizes. If set, these are run in addition to --density-ratios")
     parser.add_argument("--density-ratios", default=DENSITY_RATIOS_DEFAULT, help="Comma-separated density map ratios scanned from large to small; default max is 0.5")
+    parser.add_argument("--compression-methods", default=",".join(COMPRESSION_METHODS), help="Comma-separated density/compression methods to run")
     parser.add_argument("--normalization", choices=("all", *NORMALIZATIONS), default="all", help="Density FFT normalization to run; default runs all normalizations")
     parser.add_argument("--sparse-methods", default="spfft_grid,sparse_direct_grid")
     parser.add_argument("--sample-fraction", type=float, default=0.01, help="Legacy single sparse grid axis fraction, used only if --sample-fractions is empty")
@@ -1219,6 +1384,10 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
 
     legacy_resolutions = parse_int_list(args.resolutions) if args.resolutions.strip() else []
     density_ratios = parse_float_list(args.density_ratios)
+    compression_methods = tuple(item.strip() for item in args.compression_methods.split(",") if item.strip())
+    unknown_compression = sorted(set(compression_methods) - set(COMPRESSION_METHODS))
+    if unknown_compression:
+        raise ValueError(f"unknown compression methods: {unknown_compression}")
     density_candidates = []
     seen_sizes = set()
     for idx, ratio in enumerate(density_ratios):
@@ -1260,11 +1429,19 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
     else:
         ref_metrics = {"full_entropy": math.nan, "full_radial": [math.nan] * RADIAL_BINS, "downsample": {}}
 
+    pending_interp: list[tuple[dict, np.ndarray, str]] = []
     for curve_index, density_ratio, out_size in density_candidates:
         try:
             norms_to_run = NORMALIZATIONS if args.normalization == "all" else (args.normalization,)
             print_timing_progress(args, f"[timing] density ratio={density_ratio:g} resolution={out_size} runs={timing_runs(args.timing_warmup, args.timing_repeat)}")
-            output["records"].extend(evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run, args.timing_warmup, args.timing_repeat))
+            density_results = evaluate_density(matrix, reference, ref_metrics, out_size, density_ratio, curve_index, norms_to_run, args.timing_warmup, args.timing_repeat, compression_methods, defer_interp=reference is not None)
+            for item in density_results:
+                if isinstance(item, tuple):
+                    row, grid_cpu, label = item
+                    output["records"].append(row)
+                    pending_interp.append((row, grid_cpu, label))
+                else:
+                    output["records"].append(item)
         except Exception as exc:
             output["records"].append({"method": "density_fft", "normalization": "all", "resolution": out_size, "density_ratio": density_ratio, "curve_index": curve_index, "status": f"error:{type(exc).__name__}", "note": str(exc)})
             clear_gpu()
@@ -1272,7 +1449,19 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
     for method in [item.strip() for item in args.sparse_methods.split(",") if item.strip()]:
         for curve_index, sample_fraction in enumerate(sample_fractions):
             print_timing_progress(args, f"[timing] sparse method={method} sample_fraction={sample_fraction:g} runs={timing_runs(args.timing_warmup, args.timing_repeat)}")
-            output["records"].append(evaluate_sparse_grid(method, matrix, reference, ref_metrics, sample_fraction, args.sparse_batch_size, args.spfft_threads, args.spfft_library, curve_index, args.timing_warmup, args.timing_repeat))
+            result = evaluate_sparse_grid(method, matrix, reference, ref_metrics, sample_fraction, args.sparse_batch_size, args.spfft_threads, args.spfft_library, curve_index, args.timing_warmup, args.timing_repeat, defer_interp=reference is not None)
+            if isinstance(result, tuple):
+                row, grid_cpu = result
+                output["records"].append(row)
+                pending_interp.append((row, grid_cpu, f"{method}:sample_fraction={sample_fraction:g}"))
+            else:
+                output["records"].append(result)
+
+    if reference is not None and pending_interp:
+        apply_interpolated_metrics_batch(reference, ref_metrics, pending_interp, label_prefix="batched interpolated metrics")
+        for _, grid_cpu, _ in pending_interp:
+            del grid_cpu
+        pending_interp.clear()
 
     if reference is not None:
         del reference
@@ -1283,6 +1472,50 @@ def run_one_matrix(matrix_path: Path, split: str, args: argparse.Namespace) -> P
         json.dump(output, handle, indent=2, default=json_ready)
     print(f"Wrote {out_path}", flush=True)
     return out_path
+
+
+def run_one_matrix_subprocess(matrix_path: Path, split: str, args: argparse.Namespace) -> None:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--matrix",
+        str(matrix_path),
+        "--split",
+        split,
+        "--output-dir",
+        str(args.output_dir),
+        "--resolutions",
+        args.resolutions,
+        "--density-ratios",
+        args.density_ratios,
+        "--compression-methods",
+        args.compression_methods,
+        "--normalization",
+        args.normalization,
+        "--sparse-methods",
+        args.sparse_methods,
+        "--sample-fraction",
+        str(args.sample_fraction),
+        "--sample-fractions",
+        args.sample_fractions,
+        "--timing-warmup",
+        str(args.timing_warmup),
+        "--timing-repeat",
+        str(args.timing_repeat),
+        "--sparse-batch-size",
+        str(args.sparse_batch_size),
+        "--spfft-threads",
+        str(args.spfft_threads),
+        "--full-reference-cache",
+        str(args.full_reference_cache),
+        "--sparse-fft-root",
+        str(args.sparse_fft_root),
+    ]
+    if args.spfft_library:
+        cmd.extend(["--spfft-library", args.spfft_library])
+    if args.force_reference_cache:
+        cmd.append("--force-reference-cache")
+    subprocess.run(cmd, check=True)
 
 
 def main() -> int:
@@ -1312,7 +1545,7 @@ def main() -> int:
                 continue
             print(f"[{idx + 1}/{total}] {matrix_path.stem} ({matrix_path})", flush=True)
             try:
-                run_one_matrix(matrix_path, split, args)
+                run_one_matrix_subprocess(matrix_path, split, args)
             except Exception as exc:
                 clear_gpu()
                 failures.append((idx, matrix_path.stem, f"{type(exc).__name__}: {exc}"))
